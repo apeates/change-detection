@@ -13,6 +13,15 @@ from PIL import Image
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "Install requirements-train.txt to test U-Net")
 class UNetTrainingTests(unittest.TestCase):
+    def test_learning_rate_schedule_endpoints(self):
+        from train_unet import epoch_learning_rate
+
+        self.assertEqual(epoch_learning_rate(9), 0.001)
+        values = [epoch_learning_rate(epoch, 10) for epoch in range(1, 11)]
+        self.assertEqual((values[0], values[-1]), (0.001, 0.0001))
+        for first, second in zip(values, values[1:]):
+            self.assertAlmostEqual(first - second, 0.0001)
+
     def write_pair(self, root, split, name, after, mask):
         base = root / split
         before = np.zeros_like(after)
@@ -120,6 +129,19 @@ class UNetTrainingTests(unittest.TestCase):
             self.assertEqual(resumed["epoch"], 2)
             self.assertEqual(resumed["history"], expected["history"])
             torch.testing.assert_close(resumed["model_state"], expected["model_state"])
+
+            linear_run = root / "linear"
+            from train_unet import train_epoch
+
+            with patch("train_unet.train_epoch", side_effect=[0.5, RuntimeError("Interrupted")]):
+                with self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()):
+                    run_trainer(linear_run, "--epochs", "2", "--lr-schedule", "linear")
+            with patch("train_unet.train_epoch", wraps=train_epoch) as resumed_train:
+                run_trainer(linear_run, "--epochs", "2", "--lr-schedule", "linear", "--resume")
+                self.assertEqual(resumed_train.call_count, 1)
+            linear = checkpoint(linear_run / "last.pt")
+            self.assertEqual([row["learning_rate"] for row in linear["history"]], [0.001, 0.0001])
+            self.assertEqual(linear["optimizer_state"]["param_groups"][0]["lr"], 0.0001)
 
 
 if __name__ == "__main__":

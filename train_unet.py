@@ -18,7 +18,17 @@ from levir_tiles import TILE_SIZE, iter_tiles
 
 
 RUNS_ROOT = Path(__file__).resolve().parent / "runs"
-HISTORY_FIELDS = ("epoch", "train_loss", "val_precision", "val_recall", "val_f1", "val_iou")
+START_LR = 1e-3
+END_LR = 1e-4
+HISTORY_FIELDS = ("epoch", "learning_rate", "train_loss", "val_precision", "val_recall", "val_f1", "val_iou")
+
+
+def epoch_learning_rate(epoch, schedule_epochs=None):
+    if schedule_epochs is None or schedule_epochs == 1 or epoch == 1:
+        return START_LR
+    if epoch == schedule_epochs:
+        return END_LR
+    return START_LR + (END_LR - START_LR) * (epoch - 1) / (schedule_epochs - 1)
 
 
 def segmentation_loss(logits, masks):
@@ -165,6 +175,8 @@ def main():
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default="cpu")
     parser.add_argument("--epochs", type=int, default=5, help="Total target epochs, including any resumed epochs.")
+    parser.add_argument("--lr-schedule", choices=("constant", "linear"), default="constant",
+                        help="Linear mode decreases Adam's learning rate from 0.001 to 0.0001 over the run.")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smoke-tiles", type=int, help="Repeat this many positive train tiles and validate one image.")
@@ -193,18 +205,20 @@ def main():
 
     torch.manual_seed(args.seed)
     model = EarlyFusionUNet().to(args.device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=START_LR)
     output = args.output_dir or RUNS_ROOT / ("unet_smoke" if smoke else "unet")
     output.mkdir(parents=True, exist_ok=True)
     checkpoint = output / "last.pt"
     best_checkpoint = output / "best.pt"
     history_path = output / "history.csv"
+    schedule_epochs = args.epochs if args.lr_schedule == "linear" else None
     config = {
         "seed": args.seed,
         "batch_size": args.batch_size,
         "smoke_tiles": args.smoke_tiles,
         "train_samples": len(samples),
         "val_samples": len(val_samples),
+        "schedule_epochs": schedule_epochs,
     }
     history = []
     first_epoch = 1
@@ -212,9 +226,12 @@ def main():
         if not checkpoint.is_file():
             parser.error(f"No checkpoint to resume: {checkpoint}")
         saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
-        if saved.get("config") != config or not saved.get("history"):
+        saved_config = saved.get("config")
+        if not saved_config or {"schedule_epochs": None, **saved_config} != config or not saved.get("history"):
             parser.error("Checkpoint is from an older trainer or the run settings changed. Use the original settings or a new output directory.")
         history = saved["history"]
+        for row in history:
+            row.setdefault("learning_rate", epoch_learning_rate(row["epoch"], schedule_epochs))
         first_epoch = saved["epoch"] + 1
         if first_epoch > args.epochs:
             parser.error(f"Run already completed {saved['epoch']} epochs. Set a larger --epochs to continue.")
@@ -236,10 +253,14 @@ def main():
         for epoch in range(first_epoch, args.epochs + 1):
             rng = random.Random(args.seed + epoch)
             tiles = (tile for _, tile in smoke) if smoke else shuffled_train_tiles(split, samples, rng)
+            learning_rate = epoch_learning_rate(epoch, schedule_epochs)
+            for group in optimizer.param_groups:
+                group["lr"] = learning_rate
             loss = train_epoch(model, optimizer, batch_tiles(tiles, args.batch_size), args.device)
             val_metrics = validate_epoch(model, val_split, val_samples, args.batch_size, args.device)
             history.append({
                 "epoch": epoch,
+                "learning_rate": learning_rate,
                 "train_loss": loss,
                 **{f"val_{name.lower()}": score for name, score in val_metrics.items()},
             })
@@ -247,7 +268,7 @@ def main():
             if best_row(history)["epoch"] == epoch:
                 copy_checkpoint(checkpoint, best_checkpoint)
             save_history(history_path, history)
-            print(f"Epoch {epoch}/{args.epochs} | Train loss: {loss:.6f} | "
+            print(f"Epoch {epoch}/{args.epochs} | LR: {learning_rate:.6g} | Train loss: {loss:.6f} | "
                   f"Val F1: {val_metrics['F1']:.4f} | Val IoU: {val_metrics['IoU']:.4f}")
     except (ValueError, RuntimeError) as error:
         parser.error(str(error))
