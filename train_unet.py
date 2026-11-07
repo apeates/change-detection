@@ -1,21 +1,24 @@
-"""Train Early Fusion U-Net on LEVIR-CD's train split."""
+"""Train on LEVIR-CD's train split and select checkpoints on val."""
 
 import argparse
 import csv
 import random
+import shutil
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch.nn import functional as F
 
-from baseline_diff import change_metrics
+from baseline_diff import change_counts, change_metrics, metrics_from_counts
 from early_fusion_unet import EarlyFusionUNet
 from levir_data import DEFAULT_DATA_ROOT, DatasetError, list_samples, load_pair
 from levir_tiles import TILE_SIZE, iter_tiles
 
 
 RUNS_ROOT = Path(__file__).resolve().parent / "runs"
+HISTORY_FIELDS = ("epoch", "train_loss", "val_precision", "val_recall", "val_f1", "val_iou")
 
 
 def segmentation_loss(logits, masks):
@@ -78,14 +81,51 @@ def train_epoch(model, optimizer, batches, device):
     return total_loss / tile_count
 
 
-def save_checkpoint(path, model, optimizer, epoch, seed):
+@torch.inference_mode()
+def validate_epoch(model, split, samples, batch_size, device):
+    model.eval()
+    tiles = (tile for sample in samples for tile in iter_tiles(*load_pair(split, sample)))
+    totals = Counter(tp=0, fp=0, fn=0)
+    for batch in batch_tiles(tiles, batch_size):
+        inputs = torch.from_numpy(np.stack([tile.inputs for tile in batch])).to(device)
+        predictions = (model(inputs) > 0).cpu().numpy()
+        references = np.stack([tile.mask for tile in batch]).astype(bool)
+        totals.update(change_counts(predictions, references))
+    return metrics_from_counts(**totals)
+
+
+def save_checkpoint(path, model, optimizer, epoch, seed, *, history=None, config=None):
+    temporary = path.with_suffix(".pt.tmp")
     torch.save({
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "epoch": epoch,
         "seed": seed,
         "tile_size": TILE_SIZE,
-    }, path)
+        "history": history,
+        "config": config,
+    }, temporary)
+    temporary.replace(path)
+
+
+def copy_checkpoint(source, destination):
+    temporary = destination.with_suffix(".pt.tmp")
+    shutil.copyfile(source, temporary)
+    temporary.replace(destination)
+
+
+def save_history(path, history):
+    temporary = path.with_suffix(".csv.tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=HISTORY_FIELDS)
+        writer.writeheader()
+        writer.writerows(history)
+    temporary.replace(path)
+
+
+def best_row(history):
+    # max keeps the first epoch in case of a tie.
+    return max(history, key=lambda row: row["val_f1"])
 
 
 def load_model(path, device="cpu"):
@@ -124,11 +164,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default="cpu")
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=5, help="Total target epochs, including any resumed epochs.")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--smoke-tiles", type=int, help="Repeat only this many positive train tiles.")
+    parser.add_argument("--smoke-tiles", type=int, help="Repeat this many positive train tiles and validate one image.")
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--resume", action="store_true", help="Continue from last.pt in the output directory.")
     args = parser.parse_args()
     if args.epochs < 1 or args.batch_size < 1 or (args.smoke_tiles is not None and args.smoke_tiles < 1):
         parser.error("Epochs, batch size, and smoke tile count must be positive.")
@@ -140,36 +181,80 @@ def main():
         torch.set_num_threads(min(4, torch.get_num_threads()))
 
     split = args.data_root / "train"
+    val_split = args.data_root / "val"
     try:
         samples = list_samples(split)
+        val_samples = list_samples(val_split)
         smoke = find_smoke_tiles(split, samples, args.smoke_tiles) if args.smoke_tiles else None
     except ValueError as error:
         parser.error(str(error))
+    if smoke:
+        val_samples = val_samples[:1]
 
     torch.manual_seed(args.seed)
-    rng = random.Random(args.seed)
     model = EarlyFusionUNet().to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     output = args.output_dir or RUNS_ROOT / ("unet_smoke" if smoke else "unet")
     output.mkdir(parents=True, exist_ok=True)
+    checkpoint = output / "last.pt"
+    best_checkpoint = output / "best.pt"
+    history_path = output / "history.csv"
+    config = {
+        "seed": args.seed,
+        "batch_size": args.batch_size,
+        "smoke_tiles": args.smoke_tiles,
+        "train_samples": len(samples),
+        "val_samples": len(val_samples),
+    }
+    history = []
+    first_epoch = 1
+    if args.resume:
+        if not checkpoint.is_file():
+            parser.error(f"No checkpoint to resume: {checkpoint}")
+        saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        if saved.get("config") != config or not saved.get("history"):
+            parser.error("Checkpoint is from an older trainer or the run settings changed. Use the original settings or a new output directory.")
+        history = saved["history"]
+        first_epoch = saved["epoch"] + 1
+        if first_epoch > args.epochs:
+            parser.error(f"Run already completed {saved['epoch']} epochs. Set a larger --epochs to continue.")
+        model.load_state_dict(saved["model_state"])
+        optimizer.load_state_dict(saved["optimizer_state"])
+        if best_row(history)["epoch"] == saved["epoch"]:
+            copy_checkpoint(checkpoint, best_checkpoint)
+        elif not best_checkpoint.is_file():
+            parser.error(f"Missing best checkpoint from an earlier epoch: {best_checkpoint}")
+        save_history(history_path, history)
+        print(f"Resuming from epoch {saved['epoch']}.")
+    elif any(path.exists() for path in (checkpoint, best_checkpoint, history_path)):
+        parser.error(f"Run files already exist in {output}. Use --resume or a new --output-dir.")
+
+    print(f"Validation images: {len(val_samples)}" + (" (smoke check)" if smoke else ""))
     if smoke:
         print("Smoke tiles: " + ", ".join(f"{sample} ({tile.x}, {tile.y})" for sample, tile in smoke))
-    with (output / "history.csv").open("w", encoding="utf-8", newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow(("epoch", "train_loss"))
-        try:
-            for epoch in range(1, args.epochs + 1):
-                tiles = (tile for _, tile in smoke) if smoke else shuffled_train_tiles(split, samples, rng)
-                loss = train_epoch(model, optimizer, batch_tiles(tiles, args.batch_size), args.device)
-                writer.writerow((epoch, loss))
-                file.flush()
-                print(f"Epoch {epoch}/{args.epochs} | Train loss: {loss:.6f}")
-        except (ValueError, RuntimeError) as error:
-            parser.error(str(error))
+    try:
+        for epoch in range(first_epoch, args.epochs + 1):
+            rng = random.Random(args.seed + epoch)
+            tiles = (tile for _, tile in smoke) if smoke else shuffled_train_tiles(split, samples, rng)
+            loss = train_epoch(model, optimizer, batch_tiles(tiles, args.batch_size), args.device)
+            val_metrics = validate_epoch(model, val_split, val_samples, args.batch_size, args.device)
+            history.append({
+                "epoch": epoch,
+                "train_loss": loss,
+                **{f"val_{name.lower()}": score for name, score in val_metrics.items()},
+            })
+            save_checkpoint(checkpoint, model, optimizer, epoch, args.seed, history=history, config=config)
+            if best_row(history)["epoch"] == epoch:
+                copy_checkpoint(checkpoint, best_checkpoint)
+            save_history(history_path, history)
+            print(f"Epoch {epoch}/{args.epochs} | Train loss: {loss:.6f} | "
+                  f"Val F1: {val_metrics['F1']:.4f} | Val IoU: {val_metrics['IoU']:.4f}")
+    except (ValueError, RuntimeError) as error:
+        parser.error(str(error))
 
-    checkpoint = output / "last.pt"
-    save_checkpoint(checkpoint, model, optimizer, args.epochs, args.seed)
-    print(f"Saved: {checkpoint}")
+    best = best_row(history)
+    print(f"Last: {checkpoint}")
+    print(f"Best: {best_checkpoint} | epoch {best['epoch']} | Val F1 {best['val_f1']:.4f}")
     if smoke:
         sample, tile = smoke[0]
         restored = load_model(checkpoint, args.device)
