@@ -5,6 +5,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+
 from levir_data import DEFAULT_DATA_ROOT, DatasetError, load_pair
 
 
@@ -17,10 +18,17 @@ def predict_change(before, after, threshold):
     return np.abs(delta).mean(axis=-1) > threshold
 
 
-def change_metrics(prediction, reference):
-    tp = np.count_nonzero(prediction & reference)
-    fp = np.count_nonzero(prediction & ~reference)
-    fn = np.count_nonzero(~prediction & reference)
+def change_counts(prediction, reference):
+    """Count correct, false, and missed change pixels."""
+    return {
+        "tp": int(np.count_nonzero(prediction & reference)),
+        "fp": int(np.count_nonzero(prediction & ~reference)),
+        "fn": int(np.count_nonzero(~prediction & reference)),
+    }
+
+
+def metrics_from_counts(tp, fp, fn):
+    """Compute change-class metrics; undefined scores are reported as zero."""
 
     def divide(numerator, denominator):
         return numerator / denominator if denominator else 0.0
@@ -31,6 +39,10 @@ def change_metrics(prediction, reference):
         "F1": divide(2 * tp, 2 * tp + fp + fn),
         "IoU": divide(tp, tp + fp + fn),
     }
+
+
+def change_metrics(prediction, reference):
+    return metrics_from_counts(**change_counts(prediction, reference))
 
 
 def main():

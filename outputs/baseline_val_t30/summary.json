@@ -1,0 +1,29 @@
+{
+  "method": "mean_absolute_rgb_difference",
+  "split": "val",
+  "threshold": 30.0,
+  "samples": 64,
+  "masks_without_change": 8,
+  "aggregation": "pooled_change_pixel_counts",
+  "counts": {
+    "tp": 1891150,
+    "fp": 36380105,
+    "fn": 925118
+  },
+  "metrics": {
+    "Precision": 0.04941437117753259,
+    "Recall": 0.6715092455689586,
+    "F1": 0.09205470964993435,
+    "IoU": 0.0482480866278112
+  },
+  "examples": {
+    "false_alarms": {
+      "sample": "val_45.png",
+      "figure": "false_alarms.png"
+    },
+    "missed_changes": {
+      "sample": "val_58.png",
+      "figure": "missed_changes.png"
+    }
+  }
+}
