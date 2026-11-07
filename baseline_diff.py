@@ -5,7 +5,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from PIL import Image
+from levir_data import DEFAULT_DATA_ROOT, DatasetError, load_pair
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -33,11 +33,6 @@ def change_metrics(prediction, reference):
     }
 
 
-def read_image(path, mode):
-    with Image.open(path) as image:
-        return np.array(image.convert(mode))
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("sample", nargs="?", default="val_1.png")
@@ -47,15 +42,10 @@ def main():
     if not 0 <= args.threshold <= 255:
         parser.error("Threshold must be between 0 and 255.")
 
-    split = PROJECT_ROOT / "data" / "levir-cd" / "val"
     try:
-        before = read_image(split / "A" / args.sample, "RGB")
-        after = read_image(split / "B" / args.sample, "RGB")
-        reference = read_image(split / "label" / args.sample, "L") > 0
-    except FileNotFoundError as error:
-        parser.error(f"Missing image: {error.filename}")
-    if before.shape != after.shape or before.shape[:2] != reference.shape:
-        parser.error("Both images and the mask must have the same dimensions.")
+        before, after, reference = load_pair(DEFAULT_DATA_ROOT / "val", args.sample)
+    except DatasetError as error:
+        parser.error(str(error))
 
     prediction = predict_change(before, after, args.threshold)
     metrics = change_metrics(prediction, reference)
