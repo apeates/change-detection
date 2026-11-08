@@ -165,6 +165,7 @@ def evaluate_test(split, models, selection, batch_size, device, output, revision
         "revision": revision,
         "device": torch.cuda.get_device_name() if device == "cuda" else device,
         "batch_size": batch_size,
+        "method_labels": METHOD_LABELS,
         "selection": selection,
         "excluded_from_sensitivity": sorted(SENSITIVITY_EXCLUSIONS),
         "subsets": subsets,
