@@ -37,24 +37,28 @@ TEST_SAMPLES = frozenset(f"test_{index}.png" for index in range(1, 129))
 SENSITIVITY_EXCLUSIONS = frozenset(("test_9.png", "test_19.png"))
 
 
+def load_frozen_model(runs_root, method, device):
+    run, epoch, threshold = FROZEN_MODELS[method]
+    path = runs_root / run / "full" / "best.pt"
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    model = load_model(path, device)
+    if model.architecture != method or checkpoint["epoch"] != epoch:
+        raise ValueError(f"Expected {method} from epoch {epoch} at {path}.")
+    with path.open("rb") as file:
+        sha256 = hashlib.file_digest(file, "sha256").hexdigest()
+    return model, {
+        "checkpoint": str(path),
+        "checkpoint_sha256": sha256,
+        "epoch": epoch,
+        "threshold": threshold,
+    }
+
+
 def load_frozen_models(runs_root, device):
     models = {}
     selection = {PIXEL_METHOD: {"threshold": PIXEL_THRESHOLD}}
-    for method, (run, epoch, threshold) in FROZEN_MODELS.items():
-        path = runs_root / run / "full" / "best.pt"
-        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-        model = load_model(path, device)
-        if model.architecture != method or checkpoint["epoch"] != epoch:
-            raise ValueError(f"Expected {method} from epoch {epoch} at {path}.")
-        with path.open("rb") as file:
-            sha256 = hashlib.file_digest(file, "sha256").hexdigest()
-        models[method] = model
-        selection[method] = {
-            "checkpoint": str(path),
-            "checkpoint_sha256": sha256,
-            "epoch": epoch,
-            "threshold": threshold,
-        }
+    for method in FROZEN_MODELS:
+        models[method], selection[method] = load_frozen_model(runs_root, method, device)
     return models, selection
 
 

@@ -1,0 +1,56 @@
+import importlib.util
+import io
+import unittest
+import zipfile
+from unittest.mock import patch
+
+import numpy as np
+from PIL import Image
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch"), "Install requirements-train.txt to test U-Net")
+class S2LookingTestArchiveTests(unittest.TestCase):
+    def write_png(self, archive, path, pixels):
+        buffer = io.BytesIO()
+        Image.fromarray(pixels).save(buffer, format="PNG")
+        archive.writestr(path, buffer.getvalue())
+
+    def test_uses_test_split_and_unions_directional_labels(self):
+        from evaluate_s2looking import S2LookingTest
+
+        rgb = np.zeros((8, 8, 3), dtype=np.uint8)
+        added = np.zeros((8, 8), dtype=np.uint8)
+        removed = added.copy()
+        added[1, 2] = 1
+        removed[3, 4] = 255
+        with zipfile.ZipFile(io.BytesIO(), "w") as archive, \
+             patch("evaluate_s2looking.TEST_PAIR_COUNT", 1), \
+             patch("evaluate_s2looking.IMAGE_SHAPE", (8, 8)):
+            self.write_png(archive, "S2Looking/train/Image1/train.png", rgb)
+            for folder, pixels in (("Image1", rgb), ("Image2", rgb), ("label1", added), ("label2", removed)):
+                self.write_png(archive, f"S2Looking/test/{folder}/example.png", pixels)
+            dataset = S2LookingTest(archive)
+            self.assertEqual(dataset.samples, ["example.png"])
+            _, _, reference = dataset.load_pair("example.png")
+            np.testing.assert_array_equal(reference, (added != 0) | (removed != 0))
+
+            combined = np.maximum(added, removed)
+            self.write_png(archive, "S2Looking/test/label/example.png", combined)
+            dataset = S2LookingTest(archive)
+            self.assertEqual(dataset.labels, ("label",))
+            np.testing.assert_array_equal(dataset.load_pair("example.png")[2], reference)
+
+    def test_rejects_mismatched_names(self):
+        from evaluate_s2looking import S2LookingTest
+        from levir_data import DatasetError
+
+        with zipfile.ZipFile(io.BytesIO(), "w") as archive, patch("evaluate_s2looking.TEST_PAIR_COUNT", 1):
+            archive.writestr("test/Image1/first.png", b"")
+            archive.writestr("test/Image2/second.png", b"")
+            archive.writestr("test/label/first.png", b"")
+            with self.assertRaisesRegex(DatasetError, "matched S2Looking test pairs"):
+                S2LookingTest(archive)
+
+
+if __name__ == "__main__":
+    unittest.main()

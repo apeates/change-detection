@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 from collections import Counter
+from functools import partial
 from pathlib import Path
 from statistics import median
 from time import perf_counter
@@ -87,7 +88,7 @@ def benchmark_models(baseline_checkpoint, candidate_checkpoint, split, batch_siz
     }
 
 
-def save_panel(output, sample, before, after, reference, prediction, counts, threshold):
+def save_panel(output, sample, before, after, reference, prediction, counts, threshold, *, title):
     errors = np.zeros((*reference.shape, 3), dtype=np.uint8)
     errors[prediction & reference] = ERROR_COLORS["Correct change"]
     errors[prediction & ~reference] = ERROR_COLORS["False alarm"]
@@ -115,7 +116,7 @@ def save_panel(output, sample, before, after, reference, prediction, counts, thr
               label=f"{label}: {counts[field]:,}")
         for label, field in (("Correct change", "tp"), ("False alarm", "fp"), ("Missed change", "fn"))
     ], loc="center left", bbox_to_anchor=(0.03, 0.43), frameon=False)
-    fig.suptitle(f"LEVIR-CD validation | {sample} | threshold {threshold:g}")
+    fig.suptitle(f"{title} | {sample} | threshold {threshold:g}")
     fig.savefig(output, dpi=140)
     plt.close(fig)
 
@@ -189,10 +190,16 @@ def compare_validation(baseline_dir, candidate_dir):
     return comparisons
 
 
-def evaluate(model, split, threshold, batch_size, device, output, checkpoint_name, *, sweep=False):
+def evaluate(model, split, threshold, batch_size, device, output, checkpoint_name, *,
+             sweep=False, dataset="LEVIR-CD", samples=None, read_sample=None):
     if sweep and split.name != "val":
         raise ValueError("Choose thresholds on the validation split.")
 
+    if samples is None:
+        samples = list_samples(split)
+    if read_sample is None:
+        read_sample = partial(load_pair, split)
+    subset_label = "validation" if split.name == "val" else split.name
     thresholds = sorted(set((*SWEEP_THRESHOLDS, threshold))) if sweep else [threshold]
     limits = {value: torch.tensor(value, device=device).logit().item() for value in thresholds}
     totals = {value: Counter(tp=0, fp=0, fn=0) for value in thresholds}
@@ -202,8 +209,8 @@ def evaluate(model, split, threshold, batch_size, device, output, checkpoint_nam
     per_image = {value: [] for value in thresholds}
     packed_predictions = {}
     model.eval()
-    for sample in list_samples(split):
-        before, after, reference = load_pair(split, sample)
+    for sample in samples:
+        before, after, reference = read_sample(sample)
         logits = predict_logits(model, before, after, reference, batch_size, device)
         blank = not reference.any()
         if blank:
@@ -243,16 +250,18 @@ def evaluate(model, split, threshold, batch_size, device, output, checkpoint_nam
         if row is None:
             continue
         sample = row["sample"]
-        before, after, reference = load_pair(split, sample)
+        before, after, reference = read_sample(sample)
         prediction = np.unpackbits(packed_predictions[sample], axis=-1, count=reference.shape[1]).astype(bool)
         figure = f"{kind}.png"
         counts = {field: row[field] for field in COUNT_FIELDS}
-        save_panel(output / figure, sample, before, after, reference, prediction, counts, threshold)
+        save_panel(output / figure, sample, before, after, reference, prediction, counts, threshold,
+                   title=f"{dataset} {subset_label}")
         examples[kind] = {"sample": sample, "figure": figure}
 
     summary = {
         "method": getattr(model, "architecture", EarlyFusionUNet.architecture),
-        "split": "val",
+        "dataset": dataset,
+        "split": split.name,
         "checkpoint": checkpoint_name,
         "threshold": threshold,
         "samples": len(rows),
