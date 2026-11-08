@@ -40,6 +40,28 @@ class UNetTrainingTests(unittest.TestCase):
         self.assertEqual(tuple(output.shape), (1, 1, 256, 256))
         self.assertTrue(torch.isfinite(output).all().item())
 
+    def test_siamese_prediction_is_symmetric_and_survives_checkpoint_reload(self):
+        import torch
+
+        from early_fusion_unet import SiameseUNet
+        from train_unet import load_model, save_checkpoint
+
+        torch.manual_seed(42)
+        model = SiameseUNet().eval()
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        inputs = torch.rand(2, 6, 32, 48)
+        swapped = torch.cat((inputs[:, 3:], inputs[:, :3]), dim=1)
+        with tempfile.TemporaryDirectory() as directory, torch.inference_mode():
+            path = Path(directory) / "checkpoint.pt"
+            save_checkpoint(path, model, optimizer, epoch=1, seed=42)
+            restored = load_model(path)
+            expected = model(inputs)
+            self.assertEqual(expected.shape, (2, 1, 32, 48))
+            self.assertTrue(torch.isfinite(expected).all().item())
+            self.assertIsInstance(restored, SiameseUNet)
+            torch.testing.assert_close(model(swapped), expected, rtol=0, atol=0)
+            torch.testing.assert_close(restored(inputs), expected, rtol=0, atol=0)
+
     def test_training_updates_model_and_checkpoint_restores_prediction(self):
         import torch
 
@@ -112,8 +134,12 @@ class UNetTrainingTests(unittest.TestCase):
 
             run_trainer(run, "--epochs", "1")
             legacy = torch.load(run / "last.pt", map_location="cpu", weights_only=True)
+            legacy.pop("architecture")
             legacy["config"].pop("augment")
             torch.save(legacy, run / "last.pt")
+            with self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()) as stderr:
+                run_trainer(run, "--epochs", "2", "--resume", "--model", "siamese_unet")
+            self.assertIn("Checkpoint uses early_fusion_unet", stderr.getvalue())
             with self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()) as stderr:
                 run_trainer(run, "--epochs", "2", "--resume", "--augment")
             self.assertIn("run settings changed", stderr.getvalue())

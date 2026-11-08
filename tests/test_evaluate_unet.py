@@ -92,6 +92,8 @@ class EvaluateUNetTests(unittest.TestCase):
             self.assertEqual(best["baseline_threshold"], 0.35)
             self.assertEqual(best["candidate_threshold"], 0.50)
             self.assertEqual(best["f1_delta"], 0.5)
+            self.assertEqual(best["baseline_counts"], {"tp": 1, "fp": 1, "fn": 1})
+            self.assertEqual(best["candidate_counts"], {"tp": 2, "fp": 0, "fn": 0})
             self.assertEqual(best["count_delta"], {"tp": 1, "fp": -1, "fn": -1})
             self.assertEqual(best["f1_delta_ci95"], [0.0, 0.5])
 

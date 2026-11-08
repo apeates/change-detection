@@ -5,6 +5,8 @@ import csv
 import json
 from collections import Counter
 from pathlib import Path
+from statistics import median
+from time import perf_counter
 
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
@@ -12,6 +14,7 @@ import numpy as np
 import torch
 
 from baseline_diff import change_counts, metrics_from_counts
+from early_fusion_unet import EarlyFusionUNet
 from evaluate_baseline import CSV_FIELDS, ERROR_COLORS, select_examples
 from levir_data import DEFAULT_DATA_ROOT, list_samples, load_pair
 from levir_tiles import TILE_SIZE, iter_tiles
@@ -38,6 +41,50 @@ def predict_logits(model, before, after, reference, batch_size, device):
 def predict_mask(model, before, after, reference, threshold, batch_size, device):
     limit = torch.tensor(threshold, device=device).logit().item()
     return predict_logits(model, before, after, reference, batch_size, device) > limit
+
+
+@torch.inference_mode()
+def benchmark_models(baseline_checkpoint, candidate_checkpoint, split, batch_size, device):
+    """Time model forward passes for the same complete, device-resident image pair."""
+    device = torch.device(device)
+    sample = list_samples(split)[0]
+    tiles = list(iter_tiles(*load_pair(split, sample)))
+    batches = [torch.from_numpy(np.stack([tile.inputs for tile in batch])).to(device)
+               for batch in batch_tiles(tiles, batch_size)]
+    warmup_passes, timed_passes = 3, 10
+
+    def synchronize():
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elif device.type == "mps":
+            torch.mps.synchronize()
+
+    models = {}
+    for name, checkpoint in (("baseline", baseline_checkpoint), ("candidate", candidate_checkpoint)):
+        model = load_model(checkpoint, device)
+        durations = []
+        for iteration in range(warmup_passes + timed_passes):
+            synchronize()
+            start = perf_counter()
+            for inputs in batches:
+                model(inputs)
+            synchronize()
+            if iteration >= warmup_passes:
+                durations.append((perf_counter() - start) * 1000)
+        models[name] = {
+            "architecture": model.architecture,
+            "parameters": sum(parameter.numel() for parameter in model.parameters()),
+            "median_forward_ms_per_pair": median(durations),
+        }
+    return {
+        "sample": sample,
+        "tiles": len(tiles),
+        "batch_size": batch_size,
+        "device": torch.cuda.get_device_name(device) if device.type == "cuda" else device.type,
+        "warmup_passes": warmup_passes,
+        "timed_passes": timed_passes,
+        "models": models,
+    }
 
 
 def save_panel(output, sample, before, after, reference, prediction, counts, threshold):
@@ -129,6 +176,8 @@ def compare_validation(baseline_dir, candidate_dir):
             "candidate_threshold": thresholds[1],
             "baseline_metrics": before_metrics,
             "candidate_metrics": after_metrics,
+            "baseline_counts": dict(zip(COUNT_FIELDS, before_totals.tolist(), strict=True)),
+            "candidate_counts": dict(zip(COUNT_FIELDS, after_totals.tolist(), strict=True)),
             "f1_delta": after_metrics["F1"] - before_metrics["F1"],
             "f1_delta_ci95": interval.tolist(),
             "count_delta": dict(zip(COUNT_FIELDS, (after_totals - before_totals).tolist(), strict=True)),
@@ -198,7 +247,7 @@ def evaluate(model, split, threshold, batch_size, device, output, checkpoint_nam
         examples[kind] = {"sample": sample, "figure": figure}
 
     summary = {
-        "method": "early_fusion_unet",
+        "method": getattr(model, "architecture", EarlyFusionUNet.architecture),
         "split": "val",
         "checkpoint": checkpoint_name,
         "threshold": threshold,

@@ -12,7 +12,7 @@ import torch
 from torch.nn import functional as F
 
 from baseline_diff import change_counts, change_metrics, metrics_from_counts
-from early_fusion_unet import EarlyFusionUNet
+from early_fusion_unet import UNET_MODELS, EarlyFusionUNet
 from levir_data import DEFAULT_DATA_ROOT, DatasetError, list_samples, load_pair
 from levir_tiles import TILE_SIZE, iter_tiles, orient_tile
 
@@ -107,6 +107,7 @@ def validate_epoch(model, split, samples, batch_size, device):
 def save_checkpoint(path, model, optimizer, epoch, seed, *, history=None, config=None):
     temporary = path.with_suffix(".pt.tmp")
     torch.save({
+        "architecture": model.architecture,
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "epoch": epoch,
@@ -140,7 +141,10 @@ def best_row(history):
 
 def load_model(path, device="cpu"):
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    model = EarlyFusionUNet()
+    architecture = checkpoint.get("architecture", EarlyFusionUNet.architecture)
+    if architecture not in UNET_MODELS:
+        raise ValueError(f"Unknown U-Net architecture in {path}: {architecture}")
+    model = UNET_MODELS[architecture]()
     model.load_state_dict(checkpoint["model_state"])
     return model.to(device).eval()
 
@@ -173,6 +177,7 @@ def save_smoke_preview(model, sample, tile, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
+    parser.add_argument("--model", choices=tuple(UNET_MODELS), default=EarlyFusionUNet.architecture)
     parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default="cpu")
     parser.add_argument("--epochs", type=int, default=5, help="Total target epochs, including any resumed epochs.")
     parser.add_argument("--lr-schedule", choices=("constant", "linear"), default="constant",
@@ -206,9 +211,10 @@ def main():
         val_samples = val_samples[:1]
 
     torch.manual_seed(args.seed)
-    model = EarlyFusionUNet().to(args.device)
+    model = UNET_MODELS[args.model]().to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=START_LR)
-    output = args.output_dir or RUNS_ROOT / ("unet_smoke" if smoke else "unet")
+    run_name = "unet" if args.model == EarlyFusionUNet.architecture else args.model
+    output = args.output_dir or RUNS_ROOT / (f"{run_name}_smoke" if smoke else run_name)
     output.mkdir(parents=True, exist_ok=True)
     checkpoint = output / "last.pt"
     best_checkpoint = output / "best.pt"
@@ -229,6 +235,9 @@ def main():
         if not checkpoint.is_file():
             parser.error(f"No checkpoint to resume: {checkpoint}")
         saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        saved_architecture = saved.get("architecture", EarlyFusionUNet.architecture)
+        if saved_architecture != args.model:
+            parser.error(f"Checkpoint uses {saved_architecture}. Use that model or a new output directory.")
         saved_config = saved.get("config")
         if (not saved_config or {"schedule_epochs": None, "augment": False, **saved_config} != config
                 or not saved.get("history")):
@@ -250,6 +259,7 @@ def main():
     elif any(path.exists() for path in (checkpoint, best_checkpoint, history_path)):
         parser.error(f"Run files already exist in {output}. Use --resume or a new --output-dir.")
 
+    print(f"Model: {args.model} | Augmentation: {'on' if args.augment else 'off'}")
     print(f"Validation images: {len(val_samples)}" + (" (smoke check)" if smoke else ""))
     if smoke:
         print("Smoke tiles: " + ", ".join(f"{sample} ({tile.x}, {tile.y})" for sample, tile in smoke))
