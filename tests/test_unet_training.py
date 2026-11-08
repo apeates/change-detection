@@ -111,6 +111,12 @@ class UNetTrainingTests(unittest.TestCase):
                     return stdout.getvalue()
 
             run_trainer(run, "--epochs", "1")
+            legacy = torch.load(run / "last.pt", map_location="cpu", weights_only=True)
+            legacy["config"].pop("augment")
+            torch.save(legacy, run / "last.pt")
+            with self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()) as stderr:
+                run_trainer(run, "--epochs", "2", "--resume", "--augment")
+            self.assertIn("run settings changed", stderr.getvalue())
             (run / "history.csv").unlink()
             (run / "best.pt").unlink()
             self.assertIn("Resuming from epoch 1", run_trainer(run, "--epochs", "2", "--resume"))
@@ -133,15 +139,26 @@ class UNetTrainingTests(unittest.TestCase):
             linear_run = root / "linear"
             from train_unet import train_epoch
 
-            with patch("train_unet.train_epoch", side_effect=[0.5, RuntimeError("Interrupted")]):
+            with patch("train_unet.save_history", side_effect=RuntimeError("Interrupted")):
                 with self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()):
-                    run_trainer(linear_run, "--epochs", "2", "--lr-schedule", "linear")
+                    run_trainer(linear_run, "--epochs", "2", "--lr-schedule", "linear", "--augment")
             with patch("train_unet.train_epoch", wraps=train_epoch) as resumed_train:
-                run_trainer(linear_run, "--epochs", "2", "--lr-schedule", "linear", "--resume")
+                run_trainer(linear_run, "--epochs", "2", "--lr-schedule", "linear", "--augment", "--resume")
                 self.assertEqual(resumed_train.call_count, 1)
+            full_augmented = root / "full_augmented"
+            run_trainer(full_augmented, "--epochs", "2", "--lr-schedule", "linear", "--augment")
             linear = checkpoint(linear_run / "last.pt")
+            expected = checkpoint(full_augmented / "last.pt")
+            self.assertTrue(linear["config"]["augment"])
             self.assertEqual([row["learning_rate"] for row in linear["history"]], [0.001, 0.0001])
             self.assertEqual(linear["optimizer_state"]["param_groups"][0]["lr"], 0.0001)
+            self.assertEqual(linear["history"], expected["history"])
+            torch.testing.assert_close(linear["model_state"], expected["model_state"], rtol=0, atol=0)
+            (linear_run / "history.csv").unlink()
+            with patch("train_unet.train_epoch") as already_complete:
+                run_trainer(linear_run, "--epochs", "2", "--lr-schedule", "linear", "--augment", "--resume")
+                already_complete.assert_not_called()
+            self.assertTrue((linear_run / "history.csv").is_file())
 
 
 if __name__ == "__main__":

@@ -22,6 +22,19 @@ class PairTile:
     mask: np.ndarray
 
 
+def orient_tile(tile, orientation):
+    """Apply one of the eight square orientations to both dates and the label."""
+    turns, reflect = orientation % 4, orientation >= 4
+
+    def transform(array):
+        rotated = np.rot90(array, turns, axes=(-2, -1))
+        if reflect:
+            rotated = np.flip(rotated, axis=-1)
+        return np.ascontiguousarray(rotated)
+
+    return PairTile(x=tile.x, y=tile.y, inputs=transform(tile.inputs), mask=transform(tile.mask))
+
+
 def iter_tiles(before, after, mask, tile_size=TILE_SIZE) -> Iterator[PairTile]:
     """Yield non-overlapping tiles in row order, with channel-first float32 arrays."""
     if tile_size <= 0:

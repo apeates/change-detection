@@ -20,6 +20,7 @@ from train_unet import batch_tiles, load_model
 
 SWEEP_THRESHOLDS = (0.15, 0.25, 0.35, 0.50, 0.65, 0.75, 0.85)
 SWEEP_FIELDS = ("threshold", *CSV_FIELDS[1:], "blank_mask_fp_pixels", "blank_mask_fp_rate")
+COUNT_FIELDS = ("tp", "fp", "fn")
 
 
 @torch.inference_mode()
@@ -72,6 +73,69 @@ def save_panel(output, sample, before, after, reference, prediction, counts, thr
     plt.close(fig)
 
 
+def write_per_image(path, rows):
+    with path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def compare_validation(baseline_dir, candidate_dir):
+    """Compare saved reports with a paired image bootstrap at fixed operating points."""
+    baseline, candidate = (
+        json.loads((directory / "summary.json").read_text(encoding="utf-8"))
+        for directory in (baseline_dir, candidate_dir)
+    )
+    if baseline["split"] != "val" or candidate["split"] != "val":
+        raise ValueError("Compare validation reports.")
+    if baseline["threshold"] != candidate["threshold"]:
+        raise ValueError("The reports must share the same fixed threshold.")
+
+    def read_counts(directory, summary, threshold):
+        filename = "per_image.csv" if threshold == summary["threshold"] else "per_image_best.csv"
+        with (directory / filename).open(newline="", encoding="utf-8") as file:
+            rows = list(csv.DictReader(file))
+        counts = {row["sample"]: tuple(int(row[field]) for field in COUNT_FIELDS) for row in rows}
+        if len(counts) != len(rows) or len(counts) != summary["samples"] or not counts:
+            raise ValueError(f"Unexpected or duplicate validation samples in {directory / filename}.")
+        return counts
+
+    comparisons = {}
+    for name, thresholds in (
+        ("fixed_threshold", (baseline["threshold"], candidate["threshold"])),
+        ("best_threshold", (baseline["threshold_sweep"]["best_threshold"],
+                            candidate["threshold_sweep"]["best_threshold"])),
+    ):
+        reference = read_counts(baseline_dir, baseline, thresholds[0])
+        current = read_counts(candidate_dir, candidate, thresholds[1])
+        if reference.keys() != current.keys():
+            raise ValueError("The reports must contain the same validation images.")
+        samples = sorted(reference)
+        before = np.array([reference[sample] for sample in samples], dtype=np.int64)
+        after = np.array([current[sample] for sample in samples], dtype=np.int64)
+        if not np.array_equal(before[:, 0] + before[:, 2], after[:, 0] + after[:, 2]):
+            raise ValueError("Reference change pixel counts differ between the reports.")
+
+        before_totals, after_totals = before.sum(axis=0), after.sum(axis=0)
+        before_metrics = metrics_from_counts(*before_totals.tolist())
+        after_metrics = metrics_from_counts(*after_totals.tolist())
+        # Resample matched image pairs, keeping the trained models and chosen thresholds fixed.
+        indices = np.random.default_rng(42).integers(len(samples), size=(5000, len(samples)))
+        before_f1 = [metrics_from_counts(*counts)["F1"] for counts in before[indices].sum(axis=1).tolist()]
+        after_f1 = [metrics_from_counts(*counts)["F1"] for counts in after[indices].sum(axis=1).tolist()]
+        interval = np.quantile(np.subtract(after_f1, before_f1), (0.025, 0.975))
+        comparisons[name] = {
+            "baseline_threshold": thresholds[0],
+            "candidate_threshold": thresholds[1],
+            "baseline_metrics": before_metrics,
+            "candidate_metrics": after_metrics,
+            "f1_delta": after_metrics["F1"] - before_metrics["F1"],
+            "f1_delta_ci95": interval.tolist(),
+            "count_delta": dict(zip(COUNT_FIELDS, (after_totals - before_totals).tolist(), strict=True)),
+        }
+    return comparisons
+
+
 def evaluate(model, split, threshold, batch_size, device, output, checkpoint_name, *, sweep=False):
     if sweep and split.name != "val":
         raise ValueError("Choose thresholds on the validation split.")
@@ -82,7 +146,7 @@ def evaluate(model, split, threshold, batch_size, device, output, checkpoint_nam
     blank_false_alarms = Counter()
     blank_masks = 0
     blank_pixels = 0
-    rows = []
+    per_image = {value: [] for value in thresholds}
     packed_predictions = {}
     model.eval()
     for sample in list_samples(split):
@@ -96,10 +160,10 @@ def evaluate(model, split, threshold, batch_size, device, output, checkpoint_nam
             prediction = logits > limit
             counts = change_counts(prediction, reference)
             totals[value].update(counts)
+            per_image[value].append({"sample": sample, **counts, **metrics_from_counts(**counts)})
             if blank:
                 blank_false_alarms[value] += counts["fp"]
             if value == threshold:
-                rows.append({"sample": sample, **counts, **metrics_from_counts(**counts)})
                 # Keep the masks compact so rendering examples needs no second inference.
                 packed_predictions[sample] = np.packbits(prediction, axis=-1)
 
@@ -115,10 +179,8 @@ def evaluate(model, split, threshold, batch_size, device, output, checkpoint_nam
     }
 
     output.mkdir(parents=True, exist_ok=True)
-    with (output / "per_image.csv").open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
+    rows = per_image[threshold]
+    write_per_image(output / "per_image.csv", rows)
 
     chosen = select_examples(rows)
     chosen["best_detection"] = max((row for row in rows if row["tp"] > 0),
@@ -131,7 +193,7 @@ def evaluate(model, split, threshold, batch_size, device, output, checkpoint_nam
         before, after, reference = load_pair(split, sample)
         prediction = np.unpackbits(packed_predictions[sample], axis=-1, count=reference.shape[1]).astype(bool)
         figure = f"{kind}.png"
-        counts = {field: row[field] for field in ("tp", "fp", "fn")}
+        counts = {field: row[field] for field in COUNT_FIELDS}
         save_panel(output / figure, sample, before, after, reference, prediction, counts, threshold)
         examples[kind] = {"sample": sample, "figure": figure}
 
@@ -157,6 +219,8 @@ def evaluate(model, split, threshold, batch_size, device, output, checkpoint_nam
             writer.writeheader()
             writer.writerows(sweep_rows)
         best = max(sweep_rows, key=lambda row: (row["F1"], -abs(row["threshold"] - 0.50), row["threshold"]))
+        if best["threshold"] != threshold:
+            write_per_image(output / "per_image_best.csv", per_image[best["threshold"]])
         summary["threshold_sweep"] = {
             "file": "threshold_sweep.csv",
             "best_threshold": best["threshold"],

@@ -2,10 +2,37 @@ import unittest
 
 import numpy as np
 
-from levir_tiles import iter_tiles
+from levir_tiles import iter_tiles, orient_tile
 
 
 class LevirTileTests(unittest.TestCase):
+    def test_all_square_orientations_keep_dates_and_mask_aligned(self):
+        mask = np.zeros((5, 5), dtype=bool)
+        mask[0, :2] = True
+        mask[2, 1] = True
+        before = np.zeros((5, 5, 3), dtype=np.uint8)
+        after = before.copy()
+        before[mask, 0] = 255
+        after[mask, 2] = 255
+        tile = next(iter_tiles(before, after, mask, tile_size=5))
+
+        masks = set()
+        for orientation in range(8):
+            with self.subTest(orientation=orientation):
+                oriented = orient_tile(tile, orientation)
+                self.assertEqual(oriented.inputs.shape, tile.inputs.shape)
+                self.assertEqual(oriented.mask.shape, tile.mask.shape)
+                self.assertTrue(oriented.inputs.flags.c_contiguous)
+                self.assertTrue(oriented.mask.flags.c_contiguous)
+                np.testing.assert_array_equal(oriented.inputs[0], oriented.mask[0])
+                np.testing.assert_array_equal(oriented.inputs[5], oriented.mask[0])
+                self.assertEqual(oriented.mask.sum(), mask.sum())
+                self.assertEqual(set(np.unique(oriented.mask)), {0, 1})
+                masks.add(oriented.mask.tobytes())
+
+        self.assertEqual(len(masks), 8)
+        np.testing.assert_array_equal(tile.mask[0], mask)
+
     def test_tiles_cover_image_and_preserve_alignment(self):
         y, x = np.indices((1024, 1024), dtype=np.uint16)
         before = np.stack((x % 256, y % 256, (x + y) // 8), axis=-1).astype(np.uint8)

@@ -14,7 +14,7 @@ from torch.nn import functional as F
 from baseline_diff import change_counts, change_metrics, metrics_from_counts
 from early_fusion_unet import EarlyFusionUNet
 from levir_data import DEFAULT_DATA_ROOT, DatasetError, list_samples, load_pair
-from levir_tiles import TILE_SIZE, iter_tiles
+from levir_tiles import TILE_SIZE, iter_tiles, orient_tile
 
 
 RUNS_ROOT = Path(__file__).resolve().parent / "runs"
@@ -179,6 +179,8 @@ def main():
                         help="Linear mode decreases Adam's learning rate from 0.001 to 0.0001 over the run.")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--augment", action="store_true",
+                        help="Randomly rotate or reflect aligned training tiles.")
     parser.add_argument("--smoke-tiles", type=int, help="Repeat this many positive train tiles and validate one image.")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--resume", action="store_true", help="Continue from last.pt in the output directory.")
@@ -219,6 +221,7 @@ def main():
         "train_samples": len(samples),
         "val_samples": len(val_samples),
         "schedule_epochs": schedule_epochs,
+        "augment": args.augment,
     }
     history = []
     first_epoch = 1
@@ -227,13 +230,14 @@ def main():
             parser.error(f"No checkpoint to resume: {checkpoint}")
         saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
         saved_config = saved.get("config")
-        if not saved_config or {"schedule_epochs": None, **saved_config} != config or not saved.get("history"):
+        if (not saved_config or {"schedule_epochs": None, "augment": False, **saved_config} != config
+                or not saved.get("history")):
             parser.error("Checkpoint is from an older trainer or the run settings changed. Use the original settings or a new output directory.")
         history = saved["history"]
         for row in history:
             row.setdefault("learning_rate", epoch_learning_rate(row["epoch"], schedule_epochs))
         first_epoch = saved["epoch"] + 1
-        if first_epoch > args.epochs:
+        if saved["epoch"] > args.epochs:
             parser.error(f"Run already completed {saved['epoch']} epochs. Set a larger --epochs to continue.")
         model.load_state_dict(saved["model_state"])
         optimizer.load_state_dict(saved["optimizer_state"])
@@ -253,6 +257,11 @@ def main():
         for epoch in range(first_epoch, args.epochs + 1):
             rng = random.Random(args.seed + epoch)
             tiles = (tile for _, tile in smoke) if smoke else shuffled_train_tiles(split, samples, rng)
+            if args.augment:
+                # Keep the baseline's tile order and replay the same transforms after a resume.
+                # Reorienting both dates and the mask preserves the building-change label.
+                augmentation_rng = random.Random(f"{args.seed}:{epoch}:augmentation")
+                tiles = (orient_tile(tile, augmentation_rng.randrange(8)) for tile in tiles)
             learning_rate = epoch_learning_rate(epoch, schedule_epochs)
             for group in optimizer.param_groups:
                 group["lr"] = learning_rate
