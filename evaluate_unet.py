@@ -127,6 +127,11 @@ def write_per_image(path, rows):
         writer.writerows(rows)
 
 
+def resampled_f1(counts, indices):
+    totals = counts[indices].sum(axis=1)
+    return np.array([metrics_from_counts(*row)["F1"] for row in totals.tolist()])
+
+
 def compare_validation(baseline_dir, candidate_dir):
     """Compare saved reports with a paired image bootstrap at fixed operating points."""
     baseline, candidate = (
@@ -168,9 +173,8 @@ def compare_validation(baseline_dir, candidate_dir):
         after_metrics = metrics_from_counts(*after_totals.tolist())
         # Resample matched image pairs, keeping the trained models and chosen thresholds fixed.
         indices = np.random.default_rng(42).integers(len(samples), size=(5000, len(samples)))
-        before_f1 = [metrics_from_counts(*counts)["F1"] for counts in before[indices].sum(axis=1).tolist()]
-        after_f1 = [metrics_from_counts(*counts)["F1"] for counts in after[indices].sum(axis=1).tolist()]
-        interval = np.quantile(np.subtract(after_f1, before_f1), (0.025, 0.975))
+        delta = resampled_f1(after, indices) - resampled_f1(before, indices)
+        interval = np.quantile(delta, (0.025, 0.975))
         comparisons[name] = {
             "baseline_threshold": thresholds[0],
             "candidate_threshold": thresholds[1],
