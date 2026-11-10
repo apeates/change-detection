@@ -105,6 +105,40 @@ class MixedTrainingTests(unittest.TestCase):
             with self.assertRaisesRegex(DatasetError, r"LEVIR-CD/train/a.png.*S2Looking/val/b.png"):
                 audit_splits(datasets)
 
+    def test_audit_preserves_test_and_filters_s2looking_pairs_with_shared_images(self):
+        from mixed_data import S2LOOKING, Split, audit_splits
+
+        def split(pairs):
+            def read_sample(sample):
+                before, after = (np.full((2, 2, 3), value, dtype=np.uint8) for value in pairs[sample])
+                mask = np.full((2, 2), sample != "train_ok.png", dtype=bool)
+                return before, after, mask
+
+            return Split(list(pairs), read_sample)
+
+        datasets = {S2LOOKING: {
+            "train": split({"train_test.png": (1, 4), "train_val.png": (5, 2),
+                            "train_dropped_val.png": (7, 3), "train_ok.png": (8, 9)}),
+            "val": split({"val_test.png": (3, 1), "val_ok.png": (2, 10)}),
+            "test": split({"test_a.png": (1, 11), "test_b.png": (1, 12)}),
+        }}
+        with patch("mixed_data.IMAGE_SHAPE", (2, 2)):
+            cleaned, manifest = audit_splits(datasets)
+            _, rechecked = audit_splits(cleaned)
+
+        self.assertEqual(cleaned[S2LOOKING]["test"].samples, datasets[S2LOOKING]["test"].samples)
+        self.assertEqual(cleaned[S2LOOKING]["val"].samples, ["val_ok.png"])
+        self.assertEqual(cleaned[S2LOOKING]["train"].samples, ["train_ok.png"])
+        train = manifest[S2LOOKING]["train"]
+        self.assertEqual(train["official_sample_count"], 4)
+        self.assertEqual(train["change_pixels"], 0)
+        self.assertEqual(train["empty_masks"], 1)
+        self.assertEqual(train["decoded_sha256"], rechecked[S2LOOKING]["train"]["decoded_sha256"])
+        exclusions = train["excluded_samples"]
+        self.assertEqual(set(exclusions), {"train_test.png", "train_val.png", "train_dropped_val.png"})
+        self.assertEqual(exclusions["train_val.png"][0]["date"], "T2")
+        self.assertEqual(exclusions["train_val.png"][0]["shared_with"], ["S2Looking/val/val_ok.png/T1"])
+
     def test_paired_comparison_excludes_the_same_images_and_rejects_different_labels(self):
         from train_mixed_unet import compare_predictions
 

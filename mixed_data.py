@@ -1,4 +1,4 @@
-"""Audit official splits and stream balanced, reproducible mixed batches."""
+"""Audit and filter official splits, then stream reproducible mixed batches."""
 
 import hashlib
 import random
@@ -17,6 +17,7 @@ S2LOOKING = "S2Looking"
 LEVIR_COUNTS = {"train": 445, "val": 64, "test": 128}
 S2LOOKING_COUNTS = {"train": 3500, "val": 500, "test": 1000}
 TILES_PER_PAIR = (IMAGE_SHAPE[0] // TILE_SIZE) * (IMAGE_SHAPE[1] // TILE_SIZE)
+SPLIT_PRIORITY = ("test", "val", "train")
 
 
 @dataclass(frozen=True)
@@ -41,17 +42,37 @@ def open_splits(data_root, archive):
     return datasets
 
 
+def s2looking_exclusions(images_by_hash):
+    exclusions = {}
+    unexpected = []
+    for digest, matches in images_by_hash.items():
+        roles = {member[1] for member in matches}
+        if len(roles) < 2:
+            continue
+        if any(member[0] != S2LOOKING for member in matches):
+            unexpected.append(" = ".join("/".join(member) for member in matches))
+            continue
+        # Use the original holdouts, even if a matching validation pair is itself excluded.
+        preferred = next(role for role in SPLIT_PRIORITY if role in roles)
+        protected = ["/".join(member) for member in matches if member[1] == preferred]
+        for domain, split, sample, date in matches:
+            if split != preferred:
+                reasons = exclusions.setdefault((domain, split), {}).setdefault(sample, [])
+                reasons.append({"date": date, "rgb_sha256": digest.hex(), "shared_with": protected})
+    if unexpected:
+        raise DatasetError("\n".join(f"Cross-split RGB duplicate: {row}" for row in unexpected))
+    return exclusions
+
+
 def audit_splits(datasets):
-    """Check decoded RGB duplicates across split roles, including between datasets."""
-    manifest = {}
+    """Preserve test and exclude lower-priority S2Looking pairs sharing any RGB image."""
+    audited = {}
     images_by_hash = {}
     invalid = []
     for domain, splits in datasets.items():
-        manifest[domain] = {}
         for split, data in splits.items():
             print(f"Auditing {domain}/{split}: {len(data.samples)} pairs.", flush=True)
-            signature = hashlib.sha256()
-            positives, blank_masks = 0, 0
+            rows = audited[domain, split] = {}
             for sample in data.samples:
                 try:
                     before, after, mask = data.read_sample(sample)
@@ -60,29 +81,47 @@ def audit_splits(datasets):
                 except (OSError, ValueError) as error:
                     invalid.append(f"{domain}/{split}/{sample}: {error}")
                     continue
-                signature.update(sample.encode() + b"\0")
+                digests = []
                 for date, image in (("T1", before), ("T2", after)):
                     digest = hashlib.sha256(image).digest()
-                    signature.update(digest)
-                    matches = images_by_hash.setdefault(digest, {})
-                    matches.setdefault(split, []).append(f"{domain}/{split}/{sample}/{date}")
-                signature.update(hashlib.sha256(mask).digest())
-                positive = int(mask.sum())
+                    digests.append(digest)
+                    images_by_hash.setdefault(digest, []).append((domain, split, sample, date))
+                digests.append(hashlib.sha256(mask).digest())
+                rows[sample] = (digests, int(mask.sum()))
+            print(f"Audited {domain}/{split}: {len(rows)}/{len(data.samples)} pairs decoded.", flush=True)
+
+    if invalid:
+        raise DatasetError("\n".join(invalid))
+    exclusions = s2looking_exclusions(images_by_hash)
+    cleaned = {}
+    manifest = {}
+    for domain, splits in datasets.items():
+        cleaned[domain] = {}
+        manifest[domain] = {}
+        for split, data in splits.items():
+            excluded = exclusions.get((domain, split), {})
+            samples = [sample for sample in data.samples if sample not in excluded]
+            if not samples:
+                raise DatasetError(f"No pairs remain in {domain}/{split} after filtering shared RGB images.")
+            signature = hashlib.sha256()
+            positives, blank_masks = 0, 0
+            for sample in samples:
+                digests, positive = audited[domain, split][sample]
+                signature.update(sample.encode() + b"\0" + b"".join(digests))
                 positives += positive
                 blank_masks += positive == 0
+            cleaned[domain][split] = Split(samples, data.read_sample)
             manifest[domain][split] = {
-                "samples": data.samples,
+                "samples": samples,
+                "official_sample_count": len(data.samples),
+                "excluded_samples": excluded,
                 "decoded_sha256": signature.hexdigest(),
                 "change_pixels": positives,
                 "empty_masks": blank_masks,
             }
-            print(f"Audited {domain}/{split}: {len(data.samples)} pairs.", flush=True)
-
-    duplicates = [" = ".join(sample for group in matches.values() for sample in group)
-                  for matches in images_by_hash.values() if len(matches) > 1]
-    if invalid or duplicates:
-        raise DatasetError("\n".join([*invalid, *(f"Cross-split RGB duplicate: {row}" for row in duplicates)]))
-    return manifest
+            if domain == S2LOOKING:
+                print(f"Using {domain}/{split}: {len(samples)} pairs, excluded {len(excluded)}.", flush=True)
+    return cleaned, manifest
 
 
 def tile_stream(data, domain, seed, start=0):

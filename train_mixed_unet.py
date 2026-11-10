@@ -36,8 +36,9 @@ HISTORY_FIELDS = ("epoch", "learning_rate", "train_loss", "levir_val_f1", "s2loo
                   "optimizer_steps", "levir_tiles", "s2looking_tiles")
 LIMITATIONS = [
     "Single training seed. Image bootstrap intervals do not measure seed variation or geographic dependence.",
-    "Official split roles are preserved. LEVIR-CD has two documented partial train/test footprint overlaps.",
-    "Exact decoded RGB duplicates are checked across split roles. S2Looking coordinates are unavailable for a footprint audit.",
+    "Official test sets are preserved. LEVIR-CD has two documented partial train/test footprint overlaps.",
+    "S2Looking pairs sharing an exact decoded RGB image across splits are kept in test before val before train. "
+    "S2Looking coordinates are unavailable for a footprint audit.",
 ]
 
 
@@ -140,7 +141,8 @@ def compare_split(datasets, models, split, device, output, selection, revision):
                 evaluate(model, Path(split), THRESHOLD, BATCH_SIZE, device, report_dir, "best.pt",
                          dataset=name, samples=data.samples, read_sample=data.read_sample)
                 counts[role] = read_counts(report_dir / "per_image.csv")
-            comparisons[name] = {"official": compare_predictions(counts["reference"], counts["mixed"])}
+            subset = "without_shared_images" if name == S2LOOKING and split == "val" else "official"
+            comparisons[name] = {subset: compare_predictions(counts["reference"], counts["mixed"])}
             if name == LEVIR and split == "test":
                 sensitivity = compare_predictions(counts["reference"], counts["mixed"], SENSITIVITY_EXCLUSIONS)
                 sensitivity["excluded"] = sorted(SENSITIVITY_EXCLUSIONS)
@@ -310,7 +312,7 @@ def main():
             return
         print(f"Checking the frozen reference under {args.runs_root}.", flush=True)
         reference, reference_selection = load_reference(args.runs_root, args.device)
-        manifest = audit_splits(datasets)
+        datasets, manifest = audit_splits(datasets)
         output.mkdir(parents=True, exist_ok=True)
         run = train_mixed if args.phase == "train" else test_mixed
         run(datasets, manifest, reference, reference_selection, output, args.device, args.revision)
