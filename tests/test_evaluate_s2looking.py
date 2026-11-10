@@ -51,6 +51,28 @@ class S2LookingTestArchiveTests(unittest.TestCase):
             with self.assertRaisesRegex(DatasetError, "matched S2Looking test pairs"):
                 S2LookingTest(archive)
 
+    def test_unions_colored_directional_labels_and_rejects_other_colors(self):
+        from evaluate_s2looking import S2LookingSplit
+        from levir_data import DatasetError
+
+        rgb = np.zeros((8, 8, 3), dtype=np.uint8)
+        added, removed = rgb.copy(), rgb.copy()
+        added[1, 2] = (255, 0, 0)
+        removed[3, 4] = (0, 0, 255)
+        expected = np.zeros((8, 8), dtype=bool)
+        expected[1, 2] = expected[3, 4] = True
+        with zipfile.ZipFile(io.BytesIO(), "w") as archive, patch("evaluate_s2looking.IMAGE_SHAPE", (8, 8)):
+            for folder, pixels in (("Image1", rgb), ("Image2", rgb), ("label1", added), ("label2", removed)):
+                self.write_png(archive, f"S2Looking/train/{folder}/valid.png", pixels)
+                invalid = pixels.copy()
+                if folder == "label1":
+                    invalid[0, 0] = (0, 255, 0)
+                self.write_png(archive, f"S2Looking/train/{folder}/invalid.png", invalid)
+            dataset = S2LookingSplit(archive, "train", 2)
+            np.testing.assert_array_equal(dataset.load_pair("valid.png")[2], expected)
+            with self.assertRaisesRegex(DatasetError, "label1/invalid.png"):
+                dataset.load_pair("invalid.png")
+
     def test_read_error_identifies_the_corrupt_zip_member(self):
         from evaluate_s2looking import S2LookingSplit
         from levir_data import DatasetError

@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -42,6 +42,18 @@ class ColabMixedLoggingTests(unittest.TestCase):
             log = (logs / "train.log").read_text(encoding="utf-8")
             self.assertIn("Checking data\nFailed to read sample.png", log)
             self.assertIn("Çıkış kodu: 2", log)
+
+            broken_log = Mock()
+            broken_log.write.side_effect = [None, OSError("simulated Drive write failure")]
+            with patch.object(Path, "open", return_value=broken_log):
+                with self.assertRaisesRegex(RuntimeError, "Failed to read sample.png"):
+                    namespace["run_mixed"]("train")
+            self.assertIn("simulated Drive write failure", console.getvalue())
+            broken_log.close.assert_called_once()
+
+            with patch.object(Path, "open", side_effect=OSError("simulated Drive open failure")):
+                namespace["run_mixed"]("smoke")
+            self.assertIn("simulated Drive open failure", console.getvalue())
 
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "Install requirements-train.txt to test U-Net")

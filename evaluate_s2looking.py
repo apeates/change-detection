@@ -60,15 +60,28 @@ class S2LookingSplit:
             raise DatasetError(f"{group}/{sample}: expected 1024×1024 pixels.")
         return pixels
 
+    def read_mask(self, group, sample):
+        if group == "label":
+            mask = self.read_image(group, sample, "L")
+            if np.any((mask != 0) & (mask != 1) & (mask != 255)):
+                raise DatasetError(f"{group}/{sample}: expected binary labels encoded as 0/1 or 0/255.")
+            return mask != 0
+
+        # The directional labels can use red or blue foregrounds on black.
+        mask = self.read_image(group, sample, "RGB")
+        red, green, blue = np.moveaxis(mask, -1, 0)
+        gray = (red == green) & (green == blue) & ((green == 0) | (green == 1) | (green == 255))
+        red_or_blue = (green == 0) & ((red == 0) | (blue == 0))
+        if not np.all(gray | red_or_blue):
+            raise DatasetError(f"{group}/{sample}: expected binary grayscale or red/blue directional labels.")
+        return mask.any(axis=-1)
+
     def load_pair(self, sample):
         before = self.read_image("image1", sample, "RGB")
         after = self.read_image("image2", sample, "RGB")
         reference = np.zeros(IMAGE_SHAPE, dtype=bool)
         for group in self.labels:
-            mask = self.read_image(group, sample, "L")
-            if np.any((mask != 0) & (mask != 1) & (mask != 255)):
-                raise DatasetError(f"{group}/{sample}: expected binary labels encoded as 0/1 or 0/255.")
-            reference |= mask != 0
+            reference |= self.read_mask(group, sample)
         return before, after, reference
 
 
