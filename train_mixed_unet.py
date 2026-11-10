@@ -63,9 +63,20 @@ def validation_f1(model, datasets, device, limit=None):
     scores = {}
     for name, splits in datasets.items():
         data = splits["val"]
-        scores[name] = validate_epoch(model, Path("val"), data.samples[:limit], BATCH_SIZE, device,
+        samples = data.samples[:limit]
+        print(f"Validating {name}: {len(samples)} pairs.", flush=True)
+        scores[name] = validate_epoch(model, Path("val"), samples, BATCH_SIZE, device,
                                       read_sample=data.read_sample)["F1"]
     return scores
+
+
+def training_batches(datasets, epoch):
+    start = (epoch - 1) * STEPS_PER_EPOCH
+    batches = mixed_batches(datasets, SEED, start, STEPS_PER_EPOCH)
+    for step, batch in enumerate(batches, 1):
+        yield batch
+        if step % 500 == 0 or step == STEPS_PER_EPOCH:
+            print(f"Epoch {epoch}/{EPOCHS} | {step}/{STEPS_PER_EPOCH} training updates completed.", flush=True)
 
 
 def load_reference(runs_root, device):
@@ -124,6 +135,7 @@ def compare_split(datasets, models, split, device, output, selection, revision):
             data = domain[split]
             counts = {}
             for role, model in models.items():
+                print(f"Comparing {name}/{split}: {role} on {len(data.samples)} pairs.", flush=True)
                 report_dir = staged / name / role
                 evaluate(model, Path(split), THRESHOLD, BATCH_SIZE, device, report_dir, "best.pt",
                          dataset=name, samples=data.samples, read_sample=data.read_sample)
@@ -142,8 +154,14 @@ def compare_split(datasets, models, split, device, output, selection, revision):
 
 def training_state(datasets, output, manifest, reference, reference_selection, device, revision):
     last = output / "last.pt"
-    saved = torch.load(last, map_location="cpu", weights_only=True) if last.is_file() else None
-    baseline = saved["config"]["reference_validation"] if saved is not None else validation_f1(reference, datasets, device)
+    saved = None
+    if last.is_file():
+        print(f"Reading resume checkpoint {last}.", flush=True)
+        saved = torch.load(last, map_location="cpu", weights_only=True)
+        baseline = saved["config"]["reference_validation"]
+    else:
+        print("Measuring the frozen reference on both validation splits.", flush=True)
+        baseline = validation_f1(reference, datasets, device)
     config = {
         "revision": revision,
         "seed": SEED,
@@ -177,8 +195,7 @@ def training_state(datasets, output, manifest, reference, reference_selection, d
     return config, saved, history, baseline
 
 
-def train_mixed(datasets, manifest, runs_root, output, device, revision):
-    reference, reference_selection = load_reference(runs_root, device)
+def train_mixed(datasets, manifest, reference, reference_selection, output, device, revision):
     config, saved, history, baseline = training_state(
         datasets, output, manifest, reference, reference_selection, device, revision)
     write_json(output / "split_manifest.json", manifest)
@@ -210,13 +227,14 @@ def train_mixed(datasets, manifest, runs_root, output, device, revision):
         rate = epoch_learning_rate(epoch, EPOCHS)
         for group in optimizer.param_groups:
             group["lr"] = rate
-        batches = mixed_batches(datasets, SEED, (epoch - 1) * STEPS_PER_EPOCH, STEPS_PER_EPOCH)
-        loss = train_epoch(model, optimizer, batches, device)
+        print(f"Epoch {epoch}/{EPOCHS} | training at learning rate {rate:.6g}.", flush=True)
+        loss = train_epoch(model, optimizer, training_batches(datasets, epoch), device)
         scores = validation_f1(model, datasets, device)
         updates = epoch * STEPS_PER_EPOCH
         history.append({"epoch": epoch, "learning_rate": rate, "train_loss": loss,
                         "levir_val_f1": scores[LEVIR], "s2looking_val_f1": scores[S2LOOKING],
                         "optimizer_steps": updates, "levir_tiles": updates, "s2looking_tiles": updates})
+        print(f"Epoch {epoch}/{EPOCHS} | saving checkpoint to {last}.", flush=True)
         save_checkpoint(last, model, optimizer, epoch, SEED, history=history, config=config)
         if select_epoch(history, baseline[LEVIR])["epoch"] == epoch:
             copy_checkpoint(last, best)
@@ -249,14 +267,13 @@ def train_mixed(datasets, manifest, runs_root, output, device, revision):
     print(json.dumps(selection, indent=2))
 
 
-def test_mixed(datasets, manifest, runs_root, output, device, revision):
+def test_mixed(datasets, manifest, reference, reference_selection, output, device, revision):
     selection = json.loads((output / "selection.json").read_text(encoding="utf-8"))
-    reference, source = load_reference(runs_root, device)
     best = output / "best.pt"
     fingerprints = {domain: {split: entry["decoded_sha256"] for split, entry in splits.items()}
                     for domain, splits in manifest.items()}
     if (selection["threshold"] != THRESHOLD or selection["optimizer_steps"] != EPOCHS * STEPS_PER_EPOCH
-            or selection["reference"]["checkpoint_sha256"] != source["checkpoint_sha256"]
+            or selection["reference"]["checkpoint_sha256"] != reference_selection["checkpoint_sha256"]
             or selection["mixed"]["checkpoint_sha256"] != checkpoint_sha256(best)
             or selection["data_sha256"] != fingerprints):
         raise ValueError("Test requires the frozen checkpoint identities, data and threshold.")
@@ -281,22 +298,22 @@ def main():
     output = args.runs_root / RUN_NAME
     if args.phase == "test" and not (output / "selection.json").is_file():
         parser.error("Complete mixed training and freeze the selection before evaluating test.")
-    try:
-        with zipfile.ZipFile(args.s2looking_archive) as archive:
-            datasets = open_splits(args.data_root, archive)
-            if args.phase == "smoke":
-                torch.manual_seed(SEED)
-                model = SiameseUNet().to(args.device)
-                optimizer = torch.optim.Adam(model.parameters(), lr=START_LR)
-                loss = train_epoch(model, optimizer, mixed_batches(datasets, SEED, 0, 8), args.device)
-                print(f"Smoke | 8 mixed updates | loss {loss:.4f} | val F1 {validation_f1(model, datasets, args.device, 1)}")
-                return
-            manifest = audit_splits(datasets)
-            output.mkdir(parents=True, exist_ok=True)
-            run = train_mixed if args.phase == "train" else test_mixed
-            run(datasets, manifest, args.runs_root, output, args.device, args.revision)
-    except (OSError, ValueError, RuntimeError, KeyError, zipfile.BadZipFile) as error:
-        parser.error(str(error))
+    print(f"Indexing LEVIR-CD at {args.data_root} and S2Looking at {args.s2looking_archive}.", flush=True)
+    with zipfile.ZipFile(args.s2looking_archive) as archive:
+        datasets = open_splits(args.data_root, archive)
+        if args.phase == "smoke":
+            torch.manual_seed(SEED)
+            model = SiameseUNet().to(args.device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=START_LR)
+            loss = train_epoch(model, optimizer, mixed_batches(datasets, SEED, 0, 8), args.device)
+            print(f"Smoke | 8 mixed updates | loss {loss:.4f} | val F1 {validation_f1(model, datasets, args.device, 1)}")
+            return
+        print(f"Checking the frozen reference under {args.runs_root}.", flush=True)
+        reference, reference_selection = load_reference(args.runs_root, args.device)
+        manifest = audit_splits(datasets)
+        output.mkdir(parents=True, exist_ok=True)
+        run = train_mixed if args.phase == "train" else test_mixed
+        run(datasets, manifest, reference, reference_selection, output, args.device, args.revision)
 
 
 if __name__ == "__main__":

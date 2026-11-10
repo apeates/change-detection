@@ -51,6 +51,23 @@ class S2LookingTestArchiveTests(unittest.TestCase):
             with self.assertRaisesRegex(DatasetError, "matched S2Looking test pairs"):
                 S2LookingTest(archive)
 
+    def test_read_error_identifies_the_corrupt_zip_member(self):
+        from evaluate_s2looking import S2LookingSplit
+        from levir_data import DatasetError
+
+        buffer = io.BytesIO()
+        member = "S2Looking/train/Image1/example.png"
+        payload = b"damaged image payload"
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr(member, payload)
+            archive.writestr("S2Looking/train/Image2/example.png", b"")
+            archive.writestr("S2Looking/train/label/example.png", b"")
+        damaged = buffer.getvalue().replace(payload, b"X" * len(payload))
+        with zipfile.ZipFile(io.BytesIO(damaged)) as archive:
+            dataset = S2LookingSplit(archive, "train", 1)
+            with self.assertRaisesRegex(DatasetError, "train/Image1/example.png.*CRC"):
+                dataset.load_pair("example.png")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -49,6 +49,7 @@ def audit_splits(datasets):
     for domain, splits in datasets.items():
         manifest[domain] = {}
         for split, data in splits.items():
+            print(f"Auditing {domain}/{split}: {len(data.samples)} pairs.", flush=True)
             signature = hashlib.sha256()
             positives, blank_masks = 0, 0
             for sample in data.samples:

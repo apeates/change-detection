@@ -5,6 +5,7 @@ import csv
 import json
 import tempfile
 import zipfile
+import zlib
 from pathlib import Path, PurePosixPath
 
 import numpy as np
@@ -49,8 +50,12 @@ class S2LookingSplit:
         self.samples = sorted(names)
 
     def read_image(self, group, sample, mode):
-        with self.archive.open(self.entries[group][sample]) as file, Image.open(file) as image:
-            pixels = np.array(image.convert(mode))
+        entry = self.entries[group][sample]
+        try:
+            with self.archive.open(entry) as file, Image.open(file) as image:
+                pixels = np.array(image.convert(mode))
+        except (OSError, ValueError, EOFError, zipfile.BadZipFile, zlib.error) as error:
+            raise DatasetError(f"Cannot read S2Looking ZIP member {entry.filename}: {error}") from error
         if pixels.shape[:2] != IMAGE_SHAPE:
             raise DatasetError(f"{group}/{sample}: expected 1024×1024 pixels.")
         return pixels
