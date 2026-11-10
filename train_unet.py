@@ -5,6 +5,7 @@ import csv
 import random
 import shutil
 from collections import Counter
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -92,9 +93,11 @@ def train_epoch(model, optimizer, batches, device):
 
 
 @torch.inference_mode()
-def validate_epoch(model, split, samples, batch_size, device):
+def validate_epoch(model, split, samples, batch_size, device, *, read_sample=None):
     model.eval()
-    tiles = (tile for sample in samples for tile in iter_tiles(*load_pair(split, sample)))
+    if read_sample is None:
+        read_sample = partial(load_pair, split)
+    tiles = (tile for sample in samples for tile in iter_tiles(*read_sample(sample)))
     totals = Counter(tp=0, fp=0, fn=0)
     for batch in batch_tiles(tiles, batch_size):
         inputs = torch.from_numpy(np.stack([tile.inputs for tile in batch])).to(device)
@@ -125,10 +128,10 @@ def copy_checkpoint(source, destination):
     temporary.replace(destination)
 
 
-def save_history(path, history):
+def save_history(path, history, *, fieldnames=HISTORY_FIELDS):
     temporary = path.with_suffix(".csv.tmp")
     with temporary.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=HISTORY_FIELDS)
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(history)
     temporary.replace(path)

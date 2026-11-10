@@ -30,10 +30,13 @@ def list_samples(split: Path) -> list[str]:
     samples = sorted(set.union(*files_by_folder.values()))
     if not samples:
         raise DatasetError(f"No PNG samples found in {split}")
+    unmatched = []
     for sample in samples:
         missing = [folder for folder, names in files_by_folder.items() if sample not in names]
         if missing:
-            raise DatasetError(f"{sample}: missing file in {', '.join(missing)} ({split})")
+            unmatched.append(f"{sample}: missing file in {', '.join(missing)}")
+    if unmatched:
+        raise DatasetError(f"{split}: {'; '.join(unmatched)}")
     return samples
 
 

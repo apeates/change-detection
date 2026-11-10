@@ -21,29 +21,31 @@ IMAGE_SHAPE = (1024, 1024)
 ARCHIVE_ID = "1YAUrUp3QtZ6VMM1nSuqOjveIVO9ADOY1"
 
 
-class S2LookingTest:
+class S2LookingSplit:
     """Index the author's PNG files directly inside the ZIP."""
 
-    def __init__(self, archive):
+    def __init__(self, archive, split, expected):
         self.archive = archive
         self.entries = {group: {} for group in ("image1", "image2", "label", "label1", "label2")}
         for entry in archive.infolist():
             path = PurePosixPath(entry.filename)
-            if (entry.is_dir() or len(path.parts) < 3 or path.parts[-3].lower() != "test"
+            if (entry.is_dir() or len(path.parts) < 3 or path.parts[-3].lower() != split
                     or path.suffix.lower() != ".png" or path.name.startswith(".") or "__MACOSX" in path.parts):
                 continue
             group = path.parent.name.lower()
             if group not in self.entries:
                 continue
             if path.name in self.entries[group]:
-                raise DatasetError(f"Duplicate S2Looking test file: {group}/{path.name}.")
+                raise DatasetError(f"Duplicate S2Looking {split} file: {group}/{path.name}.")
             self.entries[group][path.name] = entry
 
         self.labels = ("label",) if self.entries["label"] else ("label1", "label2")
-        names = self.entries["image1"].keys()
-        if len(names) != TEST_PAIR_COUNT or any(
-                self.entries[group].keys() != names for group in ("image2", *self.labels)):
-            raise DatasetError(f"Expected {TEST_PAIR_COUNT} matched S2Looking test pairs with binary labels.")
+        groups = ("image1", "image2", *self.labels)
+        names = set.union(*(set(self.entries[group]) for group in groups))
+        missing = [f"{group}/{name}" for group in groups for name in sorted(names - self.entries[group].keys())]
+        if len(names) != expected or missing:
+            raise DatasetError(f"Expected {expected} matched S2Looking {split} pairs with binary labels, "
+                               f"found {len(names)} names. Missing: {', '.join(missing) or 'none listed'}.")
         self.samples = sorted(names)
 
     def read_image(self, group, sample, mode):
@@ -63,6 +65,11 @@ class S2LookingTest:
                 raise DatasetError(f"{group}/{sample}: expected binary labels encoded as 0/1 or 0/255.")
             reference |= mask != 0
         return before, after, reference
+
+
+class S2LookingTest(S2LookingSplit):
+    def __init__(self, archive):
+        super().__init__(archive, "test", TEST_PAIR_COUNT)
 
 
 def evaluate_transfer(archive, runs_root, output, batch_size, device, revision=None):
