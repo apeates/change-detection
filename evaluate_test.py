@@ -1,4 +1,4 @@
-"""Evaluate the three frozen LEVIR-CD methods on the official test split."""
+"""Evaluate frozen LEVIR-CD methods on the official test split."""
 
 import argparse
 import csv
@@ -12,7 +12,9 @@ import numpy as np
 import torch
 
 from baseline_diff import change_counts, metrics_from_counts, predict_change
+from bit import BIT
 from evaluate_baseline import CSV_FIELDS, ERROR_COLORS, select_examples
+from evaluate_bit import read_bit_selection
 from evaluate_unet import COUNT_FIELDS, predict_mask, resampled_f1
 from levir_data import DEFAULT_DATA_ROOT, DatasetError, list_samples, load_pair
 from train_unet import load_model
@@ -25,6 +27,7 @@ METHOD_LABELS = {
     PIXEL_METHOD: "Pixel difference",
     EARLY_FUSION: "Early Fusion U-Net",
     SIAMESE: "Siamese U-Net",
+    BIT.architecture: "BIT",
 }
 PIXEL_THRESHOLD = 30
 # Best checkpoints and thresholds were chosen on validation before opening test.
@@ -54,11 +57,17 @@ def load_frozen_model(runs_root, method, device):
     }
 
 
-def load_frozen_models(runs_root, device):
+def load_frozen_models(runs_root, device, *, bit_run=None):
     models = {}
     selection = {PIXEL_METHOD: {"threshold": PIXEL_THRESHOLD}}
     for method in FROZEN_MODELS:
         models[method], selection[method] = load_frozen_model(runs_root, method, device)
+    if bit_run is not None:
+        checkpoint, selection[BIT.architecture] = read_bit_selection(bit_run)
+        model = load_model(checkpoint, device)
+        if model.architecture != BIT.architecture:
+            raise ValueError("The frozen BIT checkpoint has the wrong architecture.")
+        models[BIT.architecture] = model
     return models, selection
 
 
@@ -81,19 +90,25 @@ def summarize_subset(rows_by_method, excluded=()):
             "blank_mask_fp_rate": blank_fp / blank_pixels if blank_pixels else None,
         }
     paired_delta = f1_draws[SIAMESE] - f1_draws[EARLY_FUSION]
-    return {
+    summary = {
         "samples": sample_count,
         "methods": methods,
         "siamese_vs_early_fusion_f1_delta": methods[SIAMESE]["metrics"]["F1"] - methods[EARLY_FUSION]["metrics"]["F1"],
         "siamese_vs_early_fusion_f1_delta_ci95": np.quantile(paired_delta, (0.025, 0.975)).tolist(),
     }
+    if BIT.architecture in methods:
+        delta = f1_draws[BIT.architecture] - f1_draws[SIAMESE]
+        summary["bit_vs_siamese_f1_delta"] = methods[BIT.architecture]["metrics"]["F1"] - methods[SIAMESE]["metrics"]["F1"]
+        summary["bit_vs_siamese_f1_delta_ci95"] = np.quantile(delta, (0.025, 0.975)).tolist()
+    return summary
 
 
 def save_comparison(path, sample, before, after, reference, predictions, selection):
-    fig, axes = plt.subplots(2, 3, figsize=(13, 8), layout="constrained")
+    columns = len(predictions)
+    fig, axes = plt.subplots(2, columns, figsize=(13 if columns == 3 else 16, 8), layout="constrained")
     for ax in axes.flat:
         ax.set_axis_off()
-    for ax, image, title in zip(axes[0], (before, after, reference), ("T1", "T2", "Reference mask"), strict=True):
+    for ax, image, title in zip(axes[0, :3], (before, after, reference), ("T1", "T2", "Reference mask"), strict=True):
         ax.imshow(image, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
         ax.set_title(title)
     for ax, (method, prediction) in zip(axes[1], predictions.items(), strict=True):
@@ -124,9 +139,9 @@ def evaluate_test(split, models, selection, batch_size, device, output, revision
     if split.name != "test" or set(samples) != TEST_SAMPLES:
         raise DatasetError("Expected the official test split with test_1.png through test_128.png.")
 
-    rows = {method: [] for method in METHOD_LABELS}
+    rows = {method: [] for method in (PIXEL_METHOD, *models)}
     packed = {}
-    for sample in samples:
+    for index, sample in enumerate(samples, 1):
         before, after, reference = load_pair(split, sample)
         if reference.shape != (1024, 1024):
             raise DatasetError(f"{sample}: expected a full-resolution 1024×1024 test pair.")
@@ -140,6 +155,8 @@ def evaluate_test(split, models, selection, batch_size, device, output, revision
             rows[method].append({"sample": sample, **counts, **metrics_from_counts(**counts),
                                  "blank_mask_pixels": blank_pixels})
         packed[sample] = {method: np.packbits(prediction, axis=-1) for method, prediction in predictions.items()}
+        if BIT.architecture in models and index % 16 == 0:
+            print(f"Test images {index}/{len(samples)}", flush=True)
 
     subsets = {"full": summarize_subset(rows), "sensitivity": summarize_subset(rows, SENSITIVITY_EXCLUSIONS)}
     write_table(output / "per_image.csv", ("method", *CSV_FIELDS, "blank_mask_pixels", "included_in_sensitivity"),
@@ -169,12 +186,18 @@ def evaluate_test(split, models, selection, batch_size, device, output, revision
         "revision": revision,
         "device": torch.cuda.get_device_name() if device == "cuda" else device,
         "batch_size": batch_size,
-        "method_labels": METHOD_LABELS,
+        "method_labels": {method: METHOD_LABELS[method] for method in rows},
         "selection": selection,
         "excluded_from_sensitivity": sorted(SENSITIVITY_EXCLUSIONS),
         "subsets": subsets,
         "examples": examples,
     }
+    if BIT.architecture in models:
+        summary["limitations"] = [
+            "BIT and Siamese each use one training seed; paired intervals resample images.",
+            "The official split has two known partial train/test footprint overlaps; see the sensitivity subset.",
+            "Nearby footprints can remain dependent in both subsets.",
+        ]
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     return summary
 
@@ -187,6 +210,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--revision")
+    parser.add_argument("--bit-run", type=Path, help="Completed BIT run with a frozen validation selection.")
     args = parser.parse_args()
     if args.batch_size < 1:
         parser.error("Batch size must be positive.")
@@ -197,7 +221,7 @@ def main():
     if args.device == "cpu":
         torch.set_num_threads(min(4, torch.get_num_threads()))
     try:
-        models, selection = load_frozen_models(args.runs_root, args.device)
+        models, selection = load_frozen_models(args.runs_root, args.device, bit_run=args.bit_run)
         args.output_dir.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=args.output_dir.parent) as directory:
             staged = Path(directory) / "report"

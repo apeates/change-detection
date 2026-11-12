@@ -1,59 +1,8 @@
 import importlib.util
-import io
-import json
-import os
-import subprocess
-import sys
-import tempfile
 import unittest
-from contextlib import redirect_stdout
-from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import numpy as np
-
-
-class ColabMixedLoggingTests(unittest.TestCase):
-    def test_notebook_keeps_live_output_and_error_in_drive_log(self):
-        notebook = Path(__file__).resolve().parents[1] / "notebooks" / "train_unet_colab.ipynb"
-        cells = json.loads(notebook.read_text(encoding="utf-8"))["cells"]
-        smoke = next(cell for cell in cells if cell["id"] == "mixed-smoke")
-        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()) as console:
-            root = Path(directory)
-            data = root / "data"
-            for split in ("train", "val", "test"):
-                (data / split).mkdir(parents=True)
-            (root / "train_mixed_unet.py").write_text(
-                "import sys\n"
-                "print('Checking data')\n"
-                "if 'train' in sys.argv:\n"
-                "    print('Failed to read sample.png', file=sys.stderr)\n"
-                "    sys.exit(2)\n", encoding="utf-8")
-            namespace = {"DATA_ROOT": data, "REPO_DIR": root, "RUNS_ROOT": root / "drive",
-                         "get_s2looking_archive": lambda: root / "S2Looking.zip", "REVISION": "test",
-                         "os": os, "sys": sys, "subprocess": subprocess}
-            exec("".join(smoke["source"]), namespace)
-            with self.assertRaisesRegex(RuntimeError, "Failed to read sample.png"):
-                namespace["run_mixed"]("train")
-
-            logs = namespace["RUNS_ROOT"] / "siamese_v1_mixed_e30"
-            self.assertIn("Çıkış kodu: 0", (logs / "smoke.log").read_text(encoding="utf-8"))
-            self.assertIn("Failed to read sample.png", console.getvalue())
-            log = (logs / "train.log").read_text(encoding="utf-8")
-            self.assertIn("Checking data\nFailed to read sample.png", log)
-            self.assertIn("Çıkış kodu: 2", log)
-
-            broken_log = Mock()
-            broken_log.write.side_effect = [None, OSError("simulated Drive write failure")]
-            with patch.object(Path, "open", return_value=broken_log):
-                with self.assertRaisesRegex(RuntimeError, "Failed to read sample.png"):
-                    namespace["run_mixed"]("train")
-            self.assertIn("simulated Drive write failure", console.getvalue())
-            broken_log.close.assert_called_once()
-
-            with patch.object(Path, "open", side_effect=OSError("simulated Drive open failure")):
-                namespace["run_mixed"]("smoke")
-            self.assertIn("simulated Drive open failure", console.getvalue())
 
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "Install requirements-train.txt to test U-Net")

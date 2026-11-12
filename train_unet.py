@@ -2,26 +2,33 @@
 
 import argparse
 import csv
+import json
 import random
 import shutil
+import sys
 from collections import Counter
 from functools import partial
+from importlib.metadata import version
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import torch
 from torch.nn import functional as F
 
 from baseline_diff import change_counts, change_metrics, metrics_from_counts
+from bit import BIT
 from early_fusion_unet import UNET_MODELS, EarlyFusionUNet
-from levir_data import DEFAULT_DATA_ROOT, DatasetError, list_samples, load_pair
+from levir_data import DEFAULT_DATA_ROOT, DatasetError, list_samples, load_pair, official_samples, split_fingerprint
 from levir_tiles import TILE_SIZE, iter_tiles, orient_tile
 
 
 RUNS_ROOT = Path(__file__).resolve().parent / "runs"
+MODELS = {**UNET_MODELS, BIT.architecture: BIT}
 START_LR = 1e-3
 END_LR = 1e-4
 HISTORY_FIELDS = ("epoch", "learning_rate", "train_loss", "val_precision", "val_recall", "val_f1", "val_iou")
+BIT_HISTORY_FIELDS = (*HISTORY_FIELDS, "optimizer_steps", "epoch_seconds")
 
 
 def epoch_learning_rate(epoch, schedule_epochs=None):
@@ -72,11 +79,12 @@ def batch_tiles(tiles, batch_size):
         yield batch
 
 
-def train_epoch(model, optimizer, batches, device):
+def train_epoch(model, optimizer, batches, device, *, expected_steps=None):
     model.train()
     total_loss = 0.0
     tile_count = 0
-    for batch in batches:
+    steps = 0
+    for steps, batch in enumerate(batches, 1):
         inputs = torch.from_numpy(np.stack([tile.inputs for tile in batch])).to(device)
         masks = torch.from_numpy(np.stack([tile.mask for tile in batch])).to(device)
         optimizer.zero_grad(set_to_none=True)
@@ -87,6 +95,10 @@ def train_epoch(model, optimizer, batches, device):
         optimizer.step()
         total_loss += loss.item() * len(batch)
         tile_count += len(batch)
+        if expected_steps and steps % 500 == 0:
+            print(f"Training updates {steps}/{expected_steps}", flush=True)
+    if expected_steps is not None and steps != expected_steps:
+        raise RuntimeError(f"Expected {expected_steps} optimizer updates, completed {steps}.")
     if not tile_count:
         raise ValueError("No training tiles were loaded.")
     return total_loss / tile_count
@@ -145,9 +157,9 @@ def best_row(history):
 def load_model(path, device="cpu"):
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     architecture = checkpoint.get("architecture", EarlyFusionUNet.architecture)
-    if architecture not in UNET_MODELS:
-        raise ValueError(f"Unknown U-Net architecture in {path}: {architecture}")
-    model = UNET_MODELS[architecture]()
+    if architecture not in MODELS:
+        raise ValueError(f"Unknown model architecture in {path}: {architecture}")
+    model = MODELS[architecture]()
     model.load_state_dict(checkpoint["model_state"])
     return model.to(device).eval()
 
@@ -164,7 +176,7 @@ def save_smoke_preview(model, sample, tile, output):
         (tile.inputs[:3].transpose(1, 2, 0), "Before (T1)"),
         (tile.inputs[3:].transpose(1, 2, 0), "After (T2)"),
         (reference, "Reference mask"),
-        (predicted, "U-Net prediction"),
+        (predicted, "Prediction"),
     )
     fig, axes = plt.subplots(2, 2, figsize=(7, 7), layout="constrained")
     for ax, (image, title) in zip(axes.flat, panels):
@@ -180,7 +192,7 @@ def save_smoke_preview(model, sample, tile, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
-    parser.add_argument("--model", choices=tuple(UNET_MODELS), default=EarlyFusionUNet.architecture)
+    parser.add_argument("--model", choices=tuple(MODELS), default=EarlyFusionUNet.architecture)
     parser.add_argument("--device", choices=("cpu", "mps", "cuda"), default="cpu")
     parser.add_argument("--epochs", type=int, default=5, help="Total target epochs, including any resumed epochs.")
     parser.add_argument("--lr-schedule", choices=("constant", "linear"), default="constant",
@@ -192,6 +204,7 @@ def main():
     parser.add_argument("--smoke-tiles", type=int, help="Repeat this many positive train tiles and validate one image.")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--resume", action="store_true", help="Continue from last.pt in the output directory.")
+    parser.add_argument("--revision", help="Git revision recorded in BIT checkpoints.")
     args = parser.parse_args()
     if args.epochs < 1 or args.batch_size < 1 or (args.smoke_tiles is not None and args.smoke_tiles < 1):
         parser.error("Epochs, batch size, and smoke tile count must be positive.")
@@ -204,9 +217,11 @@ def main():
 
     split = args.data_root / "train"
     val_split = args.data_root / "val"
+    is_bit = args.model == BIT.architecture
     try:
-        samples = list_samples(split)
-        val_samples = list_samples(val_split)
+        list_pairs = official_samples if is_bit and not args.smoke_tiles else list_samples
+        samples = list_pairs(split)
+        val_samples = list_pairs(val_split)
         smoke = find_smoke_tiles(split, samples, args.smoke_tiles) if args.smoke_tiles else None
     except ValueError as error:
         parser.error(str(error))
@@ -214,7 +229,7 @@ def main():
         val_samples = val_samples[:1]
 
     torch.manual_seed(args.seed)
-    model = UNET_MODELS[args.model]().to(args.device)
+    model = MODELS[args.model]().to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=START_LR)
     run_name = "unet" if args.model == EarlyFusionUNet.architecture else args.model
     output = args.output_dir or RUNS_ROOT / (f"{run_name}_smoke" if smoke else run_name)
@@ -232,6 +247,21 @@ def main():
         "schedule_epochs": schedule_epochs,
         "augment": args.augment,
     }
+    fields = BIT_HISTORY_FIELDS if is_bit else HISTORY_FIELDS
+    if is_bit:
+        # Official test shares two partial footprints with train. The evaluator reports both subsets.
+        fingerprints = {}
+        if not smoke:
+            for path, names in ((split, samples), (val_split, val_samples)):
+                print(f"Fingerprinting {path.name}: {len(names)} pairs.", flush=True)
+                fingerprints[path.name] = split_fingerprint(path, names)
+        tiles_per_epoch = len(smoke) if smoke else len(samples) * (1024 // TILE_SIZE) ** 2
+        steps_per_epoch = (tiles_per_epoch + args.batch_size - 1) // args.batch_size
+        config.update({
+            "variant": BIT.variant, "initialization": "random", "head": "binary logit",
+            "revision": args.revision, "optimizer": "Adam", "loss": "BCE+Dice",
+            "fingerprints": fingerprints, "steps_per_epoch": steps_per_epoch,
+        })
     history = []
     first_epoch = 1
     if args.resume:
@@ -257,10 +287,21 @@ def main():
             copy_checkpoint(checkpoint, best_checkpoint)
         elif not best_checkpoint.is_file():
             parser.error(f"Missing best checkpoint from an earlier epoch: {best_checkpoint}")
-        save_history(history_path, history)
+        save_history(history_path, history, fieldnames=fields)
         print(f"Resuming from epoch {saved['epoch']}.")
     elif any(path.exists() for path in (checkpoint, best_checkpoint, history_path)):
         parser.error(f"Run files already exist in {output}. Use --resume or a new --output-dir.")
+    if is_bit:
+        runtime = {"python": sys.version.split()[0], "torch": str(torch.__version__),
+                   "numpy": version("numpy"), "pillow": version("Pillow"), "cuda": torch.version.cuda,
+                   "device": torch.cuda.get_device_name() if args.device == "cuda" else args.device}
+        metadata = output / "run.json"
+        environments = json.loads(metadata.read_text())["environments"] if metadata.exists() else []
+        if runtime not in environments:
+            environments.append(runtime)
+        temporary = metadata.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps({"config": config, "environments": environments}, indent=2) + "\n")
+        temporary.replace(metadata)
 
     print(f"Model: {args.model} | Augmentation: {'on' if args.augment else 'off'}")
     print(f"Validation images: {len(val_samples)}" + (" (smoke check)" if smoke else ""))
@@ -268,6 +309,7 @@ def main():
         print("Smoke tiles: " + ", ".join(f"{sample} ({tile.x}, {tile.y})" for sample, tile in smoke))
     try:
         for epoch in range(first_epoch, args.epochs + 1):
+            started = perf_counter()
             rng = random.Random(args.seed + epoch)
             tiles = (tile for _, tile in smoke) if smoke else shuffled_train_tiles(split, samples, rng)
             if args.augment:
@@ -278,7 +320,10 @@ def main():
             learning_rate = epoch_learning_rate(epoch, schedule_epochs)
             for group in optimizer.param_groups:
                 group["lr"] = learning_rate
-            loss = train_epoch(model, optimizer, batch_tiles(tiles, args.batch_size), args.device)
+            if is_bit:
+                print(f"Epoch {epoch}/{args.epochs} | training", flush=True)
+            step_options = {"expected_steps": steps_per_epoch} if is_bit else {}
+            loss = train_epoch(model, optimizer, batch_tiles(tiles, args.batch_size), args.device, **step_options)
             val_metrics = validate_epoch(model, val_split, val_samples, args.batch_size, args.device)
             history.append({
                 "epoch": epoch,
@@ -286,12 +331,15 @@ def main():
                 "train_loss": loss,
                 **{f"val_{name.lower()}": score for name, score in val_metrics.items()},
             })
+            if is_bit:
+                history[-1].update(optimizer_steps=epoch * steps_per_epoch, epoch_seconds=perf_counter() - started)
             save_checkpoint(checkpoint, model, optimizer, epoch, args.seed, history=history, config=config)
             if best_row(history)["epoch"] == epoch:
                 copy_checkpoint(checkpoint, best_checkpoint)
-            save_history(history_path, history)
+            save_history(history_path, history, fieldnames=fields)
             print(f"Epoch {epoch}/{args.epochs} | LR: {learning_rate:.6g} | Train loss: {loss:.6f} | "
-                  f"Val F1: {val_metrics['F1']:.4f} | Val IoU: {val_metrics['IoU']:.4f}")
+                  f"Val F1: {val_metrics['F1']:.4f} | Val IoU: {val_metrics['IoU']:.4f}"
+                  + (f" | updates {history[-1]['optimizer_steps']}" if is_bit else ""), flush=True)
     except (ValueError, RuntimeError) as error:
         parser.error(str(error))
 

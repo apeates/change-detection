@@ -44,8 +44,13 @@ def predict_mask(model, before, after, reference, threshold, batch_size, device)
     return predict_logits(model, before, after, reference, batch_size, device) > limit
 
 
-@torch.inference_mode()
 def benchmark_models(baseline_checkpoint, candidate_checkpoint, split, batch_size, device):
+    return benchmark_checkpoints({"baseline": baseline_checkpoint, "candidate": candidate_checkpoint},
+                                 split, batch_size, device)
+
+
+@torch.inference_mode()
+def benchmark_checkpoints(checkpoints, split, batch_size, device):
     """Time model forward passes for the same complete, device-resident image pair."""
     device = torch.device(device)
     sample = list_samples(split)[0]
@@ -61,11 +66,13 @@ def benchmark_models(baseline_checkpoint, candidate_checkpoint, split, batch_siz
             torch.mps.synchronize()
 
     models = {}
-    for name, checkpoint in (("baseline", baseline_checkpoint), ("candidate", candidate_checkpoint)):
+    for name, checkpoint in checkpoints.items():
         model = load_model(checkpoint, device)
         durations = []
         for iteration in range(warmup_passes + timed_passes):
             synchronize()
+            if device.type == "cuda" and iteration == warmup_passes:
+                torch.cuda.reset_peak_memory_stats(device)
             start = perf_counter()
             for inputs in batches:
                 model(inputs)
@@ -76,7 +83,9 @@ def benchmark_models(baseline_checkpoint, candidate_checkpoint, split, batch_siz
             "architecture": model.architecture,
             "parameters": sum(parameter.numel() for parameter in model.parameters()),
             "median_forward_ms_per_pair": median(durations),
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
         }
+        del model
     return {
         "sample": sample,
         "tiles": len(tiles),

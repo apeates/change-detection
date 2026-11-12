@@ -1,6 +1,7 @@
 """Read and validate paired LEVIR-CD images and reference masks."""
 
 import argparse
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +10,7 @@ from PIL import Image
 
 DEFAULT_DATA_ROOT = Path(__file__).resolve().parent / "data" / "levir-cd"
 PAIR_FOLDERS = ("A", "B", "label")
+OFFICIAL_COUNTS = {"train": 445, "val": 64, "test": 128}
 
 
 class DatasetError(ValueError):
@@ -73,6 +75,28 @@ def audit_split(split: Path) -> tuple[int, int]:
         if not mask.any():
             empty_masks += 1
     return len(samples), empty_masks
+
+
+def official_samples(split: Path) -> list[str]:
+    samples = list_samples(split)
+    expected = {f"{split.name}_{i}.png" for i in range(1, OFFICIAL_COUNTS[split.name] + 1)}
+    if set(samples) != expected:
+        raise DatasetError(f"{split}: missing {sorted(expected - set(samples))}, "
+                           f"unexpected {sorted(set(samples) - expected)}")
+    return samples
+
+
+def split_fingerprint(split: Path, samples: list[str]) -> str:
+    """Hash the ordered, decoded inputs and labels actually consumed by LEVIR models."""
+    digest = hashlib.sha256()
+    for sample in samples:
+        before, after, mask = load_pair(split, sample)
+        if mask.shape != (1024, 1024):
+            raise DatasetError(f"{split}/{sample}: expected a full-resolution 1024×1024 pair.")
+        digest.update(sample.encode() + b"\0")
+        for array in (before, after, mask):
+            digest.update(hashlib.sha256(array).digest())
+    return digest.hexdigest()
 
 
 def main() -> None:
