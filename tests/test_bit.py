@@ -1,3 +1,4 @@
+import csv
 import importlib.util
 import io
 import json
@@ -102,3 +103,40 @@ class BITTests(unittest.TestCase):
         self.assertEqual(cva_threshold(np.array([0, 0, 3]), np.array([2, 3, 0])), 1)
         image = np.arange(12).reshape(1, 4, 3)
         np.testing.assert_array_equal(shift_right(image, 2)[:, 2:], image[:, :2])
+
+    def test_controlled_reports_cover_five_methods_and_resource_deltas(self):
+        from benchmark_levir import CVA, OTSU, SHIFTS, write_reports
+        from evaluate_test import EARLY_FUSION, PIXEL_METHOD, SIAMESE
+
+        thresholds = {OTSU: 23, CVA: 61}
+        selection = {method: {"threshold": threshold} for method, threshold in
+                     ((PIXEL_METHOD, 30), (EARLY_FUSION, 0.35), (SIAMESE, 0.50))}
+        methods = (PIXEL_METHOD, OTSU, CVA, EARLY_FUSION, SIAMESE)
+        totals = {shift: {method: {"tp": 20 - shift, "fp": shift, "fn": shift} for method in methods}
+                  for shift in SHIFTS}
+        classical = {method: totals[0][method] for method in thresholds}
+        resources = {
+            "device": "test GPU", "sample": "val_1.png", "tiles": 16, "batch_size": 2,
+            "warmup_passes": 3, "timed_passes": 10,
+            "models": {
+                EARLY_FUSION: {"parameters": 100, "median_forward_ms_per_pair": 3, "peak_allocated_bytes": 2**20},
+                SIAMESE: {"parameters": 200, "median_forward_ms_per_pair": 4.5, "peak_allocated_bytes": 3 * 2**20},
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            write_reports(output, totals, classical, thresholds, resources, selection)
+            with (output / "robustness.csv").open() as file:
+                rows = list(csv.DictReader(file))
+            self.assertEqual([(int(row["shift_px"]), row["method"]) for row in rows],
+                             [(shift, method) for shift in SHIFTS for method in methods])
+            with (output / "classical_test.csv").open() as file:
+                self.assertEqual([row["method"] for row in csv.DictReader(file)], [OTSU, CVA])
+            protocol = json.loads((output / "protocol.json").read_text())
+            self.assertEqual((protocol["validation_pairs"], protocol["test_pairs"]), (64, 128))
+            self.assertEqual(protocol["thresholds"], {**thresholds, PIXEL_METHOD: 30, EARLY_FUSION: 0.35, SIAMESE: 0.50})
+            self.assertTrue((output / "resources.json").is_file())
+            self.assertGreater((output / "robustness.png").stat().st_size, 0)
+            summary = (output / "summary.md").read_text(encoding="utf-8")
+            for value in ("-20.00", "+1.50 ms/çift", "+2.00 MiB", "12 tamamlanmış tur"):
+                self.assertIn(value, summary)
