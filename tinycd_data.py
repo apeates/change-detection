@@ -77,10 +77,19 @@ def decode_scene(directory, name):
             frames.append(np.asarray(image.convert(mode)))
     before, after, label = frames
     codes = np.unique(label).tolist()
-    if not set(codes) <= {0, 1, 255} or {1, 255} <= set(codes):
+    values = set(codes)
+    if values <= {0, 1}:
+        changed = label == 1
+    elif values <= {0, 156, 254, 255}:
+        # The official train/val masks contain sparse non-255 foreground
+        # values. Use the same 8-bit cutoff as the existing LEVIR loader.
+        changed = label >= 128
+    else:
         raise ValueError(f"{directory.name}/label/{name}: unsupported mask values {codes}")
     packed = np.empty((7, SCENE_SIZE, SCENE_SIZE), dtype=np.uint8)
-    packed[:3], packed[3:6], packed[6] = before.transpose(2, 0, 1), after.transpose(2, 0, 1), label > 0
+    packed[:3] = before.transpose(2, 0, 1)
+    packed[3:6] = after.transpose(2, 0, 1)
+    packed[6] = changed
     return packed, codes
 
 
