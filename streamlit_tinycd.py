@@ -5,12 +5,16 @@ from pathlib import Path
 import streamlit as st
 
 from baseline_diff import change_counts, metrics_from_counts
-from levir_data import DEFAULT_DATA_ROOT
+from levir_data import DEFAULT_DATA_ROOT, OFFICIAL_COUNTS
 from tinycd_demo import DEMO_SCENES, load_demo_image, load_model, predict_scene
 from tinycd_demo_images import comparison_image, mask_png, png_bytes, prediction_overlay
 
 
 VALIDATION_DIR = DEFAULT_DATA_ROOT / "val"
+VALIDATION_SCENES = DEMO_SCENES + tuple(
+    name for name in (f"val_{index}.png" for index in range(1, OFFICIAL_COUNTS["val"] + 1))
+    if name not in DEMO_SCENES
+)
 TEST_RESULT = "LEVIR-CD resmî test sonucu · 128 görüntü çifti · değişim F1 %90,47."
 
 
@@ -73,7 +77,7 @@ def main():
     st.title("Bina Değişimi")
     st.caption(TEST_RESULT)
     choice, _ = st.columns([2, 3])
-    sample = choice.selectbox("Örnek seç", DEMO_SCENES, format_func=lambda name: Path(name).stem,
+    sample = choice.selectbox("Örnek seç", VALIDATION_SCENES, format_func=lambda name: Path(name).stem,
                               key="scene", on_change=clear_scene_result)
     paths = [VALIDATION_DIR / side / sample for side in ("A", "B")]
     try:
