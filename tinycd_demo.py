@@ -28,6 +28,7 @@ THRESHOLD = 0.5
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
 STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
 DEMO_SCENES = ("val_56.png", "val_39.png")
+TEST_DEMO_SCENES = ("test_102.png", "test_18.png", "test_108.png")
 UPSTREAM_COMMIT = "1696827ffb7473c448591aaaa4434d4d4934a1ba"
 MODEL_SOURCE_HASHES = {
     "models/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -104,23 +105,90 @@ def normalized_batch(image, regions):
 
 
 @torch.inference_mode()
-def predict_scene(model, before, after):
-    """Predict from two aligned RGB arrays. Return a 1024×1024 boolean mask."""
+def predict_probabilities(model, before, after):
+    """Predict from two aligned RGB arrays. Return a 1024×1024 float32 probability map."""
     shape = (SCENE_SIZE, SCENE_SIZE, 3)
     if any(image.shape != shape or image.dtype != np.uint8 for image in (before, after)):
         raise ValueError("Expected two aligned 1024×1024 uint8 RGB images.")
     model.eval()
     regions = [region for _, _, region in tile_regions(SCENE_SIZE, SCENE_SIZE)]
-    prediction = np.empty(shape[:2], dtype=bool)
+    probabilities_map = np.empty(shape[:2], dtype=np.float32)
     for start in range(0, len(regions), BATCH_SIZE):
         batch = regions[start:start + BATCH_SIZE]
         probabilities = model(normalized_batch(before, batch), normalized_batch(after, batch))
         if (probabilities.shape != (len(batch), 1, TILE_SIZE, TILE_SIZE)
                 or not torch.isfinite(probabilities).all()):
             raise RuntimeError("TinyCD returned invalid probabilities.")
-        for region, mask in zip(batch, (probabilities[:, 0] > THRESHOLD).numpy(), strict=True):
-            prediction[region] = mask
-    return prediction
+        for region, tile in zip(batch, probabilities[:, 0].numpy(), strict=True):
+            probabilities_map[region] = tile
+    return probabilities_map
+
+
+@torch.inference_mode()
+def predict_scene(model, before, after, threshold=THRESHOLD):
+    """Predict from two aligned RGB arrays. Return a 1024×1024 boolean mask."""
+    return predict_probabilities(model, before, after) > threshold
+
+
+def count_regions(mask, min_pixels=16):
+    """Count 8-connected foreground regions using fast row run-length union-find."""
+    if mask.ndim != 2:
+        raise ValueError("Expected a 2D boolean mask.")
+    mask = np.asarray(mask, dtype=bool)
+    if not mask.any():
+        return {"count": 0, "total_pixels": 0, "filtered_pixels": 0}
+
+    parent = []
+    sizes = []
+
+    def find(node):
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return ra
+        if sizes[ra] < sizes[rb]:
+            ra, rb = rb, ra
+        parent[rb] = ra
+        sizes[ra] += sizes[rb]
+        return ra
+
+    padded = np.pad(mask, ((0, 0), (1, 1)), constant_values=False)
+    diff = np.diff(padded.astype(np.int8), axis=1)
+    prev_runs = []
+    for row_index in range(mask.shape[0]):
+        starts = np.flatnonzero(diff[row_index] == 1)
+        if not len(starts):
+            prev_runs = []
+            continue
+        ends = np.flatnonzero(diff[row_index] == -1)
+        curr_runs = []
+        prev_idx = 0
+        prev_len = len(prev_runs)
+        for start, end in zip(starts.tolist(), ends.tolist()):
+            node = len(parent)
+            parent.append(node)
+            sizes.append(end - start)
+            while prev_idx < prev_len and prev_runs[prev_idx][1] < start:
+                prev_idx += 1
+            scan = prev_idx
+            while scan < prev_len and prev_runs[scan][0] <= end:
+                node = union(node, prev_runs[scan][2])
+                scan += 1
+            curr_runs.append((start, end, node))
+        prev_runs = curr_runs
+
+    roots = {find(index) for index in range(len(parent))}
+    kept = [sizes[root] for root in roots if sizes[root] >= min_pixels]
+    return {
+        "count": len(kept),
+        "total_pixels": int(mask.sum()),
+        "filtered_pixels": int(sum(kept)),
+    }
 
 
 def load_demo_image(path, mode="RGB"):
