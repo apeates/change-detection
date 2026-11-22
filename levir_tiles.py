@@ -35,6 +35,17 @@ def orient_tile(tile, orientation):
     return PairTile(x=tile.x, y=tile.y, inputs=transform(tile.inputs), mask=transform(tile.mask))
 
 
+def tile_regions(height, width, tile_size=TILE_SIZE):
+    """Yield (x, y, region) for every non-overlapping tile in row order."""
+    if tile_size <= 0:
+        raise ValueError("Tile size must be positive.")
+    if not height or not width or height % tile_size or width % tile_size:
+        raise ValueError(f"Image dimensions {width}x{height} must be multiples of {tile_size}.")
+    for y in range(0, height, tile_size):
+        for x in range(0, width, tile_size):
+            yield x, y, np.s_[y:y + tile_size, x:x + tile_size]
+
+
 def iter_tiles(before, after, mask, tile_size=TILE_SIZE) -> Iterator[PairTile]:
     """Yield non-overlapping tiles in row order, with channel-first float32 arrays."""
     if tile_size <= 0:
@@ -44,17 +55,12 @@ def iter_tiles(before, after, mask, tile_size=TILE_SIZE) -> Iterator[PairTile]:
     height, width = before.shape[:2]
     if mask.shape != (height, width):
         raise ValueError("The mask must match the image height and width.")
-    if not height or not width or height % tile_size or width % tile_size:
-        raise ValueError(f"Image dimensions {width}x{height} must be multiples of {tile_size}.")
-
-    for y in range(0, height, tile_size):
-        for x in range(0, width, tile_size):
-            region = np.s_[y:y + tile_size, x:x + tile_size]
-            inputs = np.concatenate((before[region], after[region]), axis=-1)
-            inputs = np.ascontiguousarray(inputs.transpose(2, 0, 1), dtype=np.float32)
-            inputs /= 255.0
-            target = mask[region][None, :, :].astype(np.float32)
-            yield PairTile(x=x, y=y, inputs=inputs, mask=target)
+    for x, y, region in tile_regions(height, width, tile_size):
+        inputs = np.concatenate((before[region], after[region]), axis=-1)
+        inputs = np.ascontiguousarray(inputs.transpose(2, 0, 1), dtype=np.float32)
+        inputs /= 255.0
+        target = mask[region][None, :, :].astype(np.float32)
+        yield PairTile(x=x, y=y, inputs=inputs, mask=target)
 
 
 def save_preview(after, tile, tile_size, sample, output):

@@ -1,7 +1,8 @@
-"""Open the frozen TinyCD demo checkpoint on CPU using local model sources."""
+"""Load TinyCD offline and predict a full-resolution change mask on CPU."""
 
 import argparse
 import hashlib
+import json
 from pathlib import Path
 import platform
 import shutil
@@ -10,12 +11,23 @@ from tempfile import NamedTemporaryFile
 from time import perf_counter
 
 import torch
+import numpy as np
+from PIL import Image
+
+from levir_data import DEFAULT_DATA_ROOT
+from levir_tiles import TILE_SIZE, tile_regions
 
 
 ARTIFACTS = Path(__file__).resolve().parent / "artifacts" / "tinycd"
 CHECKPOINT_NAME = "epoch_40-cae2a604.pt"
 CHECKPOINT_SHA256 = "dc5eca2b1ed9fa0a37fdf23993f111b9c6b06e71bb33bbcd1e6d5f3bdf64ba2a"
 EPOCH = 40
+SCENE_SIZE = 1024
+BATCH_SIZE = 8
+THRESHOLD = 0.5
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 3, 1, 1)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 3, 1, 1)
+DEMO_SCENES = ("val_56.png", "val_39.png")
 UPSTREAM_COMMIT = "1696827ffb7473c448591aaaa4434d4d4934a1ba"
 MODEL_SOURCE_HASHES = {
     "models/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
@@ -85,20 +97,87 @@ def load_model(checkpoint=None):
     return model, {"epoch": EPOCH, "sha256": digest, "path": str(path)}
 
 
+def normalized_batch(image, regions):
+    batch = np.stack([image[region].transpose(2, 0, 1) for region in regions]).astype(np.float32)
+    batch /= np.float32(255)
+    return torch.from_numpy(np.ascontiguousarray((batch - MEAN) / STD))
+
+
+@torch.inference_mode()
+def predict_scene(model, before, after):
+    """Predict from two aligned RGB arrays. Return a 1024×1024 boolean mask."""
+    shape = (SCENE_SIZE, SCENE_SIZE, 3)
+    if any(image.shape != shape or image.dtype != np.uint8 for image in (before, after)):
+        raise ValueError("Expected two aligned 1024×1024 uint8 RGB images.")
+    model.eval()
+    regions = [region for _, _, region in tile_regions(SCENE_SIZE, SCENE_SIZE)]
+    prediction = np.empty(shape[:2], dtype=bool)
+    for start in range(0, len(regions), BATCH_SIZE):
+        batch = regions[start:start + BATCH_SIZE]
+        probabilities = model(normalized_batch(before, batch), normalized_batch(after, batch))
+        if (probabilities.shape != (len(batch), 1, TILE_SIZE, TILE_SIZE)
+                or not torch.isfinite(probabilities).all()):
+            raise RuntimeError("TinyCD returned invalid probabilities.")
+        for region, mask in zip(batch, (probabilities[:, 0] > THRESHOLD).numpy(), strict=True):
+            prediction[region] = mask
+    return prediction
+
+
+def load_demo_image(path, mode="RGB"):
+    with Image.open(path) as image:
+        return np.asarray(image.convert(mode))
+
+
+def check_validation_scenes(model, metadata, load_seconds):
+    from baseline_diff import change_counts, metrics_from_counts
+
+    split = DEFAULT_DATA_ROOT / "val"
+    output = ARTIFACTS / "stage2"
+    output.mkdir(parents=True, exist_ok=True)
+    rows = {}
+    for sample in DEMO_SCENES:
+        before = load_demo_image(split / "A" / sample)
+        after = load_demo_image(split / "B" / sample)
+        started = perf_counter()
+        prediction = predict_scene(model, before, after)
+        elapsed = perf_counter() - started
+        reference = load_demo_image(split / "label" / sample, "L") >= 128
+        if reference.shape != prediction.shape:
+            raise ValueError(f"{sample}: reference mask dimensions do not match.")
+        counts = change_counts(prediction, reference)
+        mask_path = output / f"{Path(sample).stem}_mask.png"
+        Image.fromarray(prediction.astype(np.uint8) * 255).save(mask_path)
+        rows[sample] = {
+            **counts, **metrics_from_counts(**counts), "prediction_seconds": elapsed,
+            "mask": str(mask_path),
+        }
+        print(f"{sample} · {elapsed:.3f} s · {counts}", flush=True)
+    (output / "summary.json").write_text(json.dumps({
+        "model": metadata, "split": split.name, "threshold": THRESHOLD, "decision": "p > 0.5",
+        "tile_size": TILE_SIZE, "batch_size": BATCH_SIZE, "device": "cpu", "dtype": "float32",
+        "torch_threads": torch.get_num_threads(), "model_load_seconds": load_seconds, "scenes": rows,
+    }, indent=2) + "\n", encoding="utf-8")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--install-checkpoint", type=Path, metavar="PATH",
                         help="Verify a downloaded checkpoint and copy it into artifacts/tinycd.")
+    parser.add_argument("--validate-scenes", action="store_true",
+                        help="Predict and score the two fixed validation demo scenes.")
     args = parser.parse_args()
     try:
         if args.install_checkpoint is not None:
             install_checkpoint(args.install_checkpoint)
         started = perf_counter()
-        _, metadata = load_model()
+        model, metadata = load_model()
+        load_seconds = perf_counter() - started
+        if args.validate_scenes:
+            check_validation_scenes(model, metadata, load_seconds)
     except (OSError, ValueError, RuntimeError) as error:
         parser.exit(1, f"{error}\n")
     print(f"Python {platform.python_version()} · PyTorch {torch.__version__}")
-    print(f"TinyCD epoch {metadata['epoch']} · CPU float32 · {perf_counter() - started:.3f} s")
+    print(f"TinyCD epoch {metadata['epoch']} · CPU float32 · {load_seconds:.3f} s")
     print(f"Checkpoint SHA-256 {metadata['sha256']}")
     print(metadata["path"])
 
