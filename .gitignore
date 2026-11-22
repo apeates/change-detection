@@ -5,3 +5,4 @@ __pycache__/
 .DS_Store
 .mpl-cache/
 /runs/
+/artifacts/tinycd/
